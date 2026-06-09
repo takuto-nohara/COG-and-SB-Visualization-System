@@ -39,6 +39,12 @@ cogsb analyze --source file --path sample.mp4 --mode offline --output-dir output
   - `bos`（BOSポリゴン、左右接地確率、安定余裕）
   - `cop`（COP位置、反力、BOS内判定、残差）
 
+### 可視化出力
+```bash
+cogsb visualize sample.mp4 outputs/frames.jsonl
+cogsb visualize sample.mp4 outputs/frames.jsonl --output rendered.mp4
+```
+
 ## 開発メモ
 - `--mode realtime` は逐次処理を優先します。
 - `--mode offline` は動画全体を最後まで処理するのに向きます。

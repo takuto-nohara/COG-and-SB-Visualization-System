@@ -9,6 +9,7 @@ from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
 from cogsb.sources import LiveCameraSource, RecordedVideoSource
+from cogsb.visualization.render import render_video
 
 
 def analyze(
@@ -55,9 +56,18 @@ def analyze(
     engine.run(source_obj, estimator, max_frames=max_frames)
 
 
+def visualize(
+    video_path: str = typer.Argument(..., help="可視化対象の動画パス"),
+    jsonl: str = typer.Argument(..., help="Analyze時に生成された outputs/frames.jsonl"),
+    output: Optional[str] = typer.Option(None, help="出力mp4のパス（未指定なら即時表示）"),
+) -> None:
+    render_video(video_path=video_path, jsonl_path=jsonl, output_path=output)
+
+
 def main() -> None:
     app = typer.Typer()
     app.command()(analyze)
+    app.command()(visualize)
     app()
 
 
