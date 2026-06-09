@@ -22,7 +22,7 @@ class AnalysisEngine:
         self.cog_estimator = COGEstimator(gravity=config.gravity)
         self.cop_estimator = COPEstimator(default_mass_kg=70.0)
         self.smpl_fitter = smpl_fitter
-        self.prev_joints = None
+        self.prev_joints: Optional[list[tuple[float, float, float]]] = None
         self.prev_cog = None
         self.prev_cog_vel = None
         self.prev_bos_polygon = []
@@ -89,9 +89,9 @@ class AnalysisEngine:
                     fallback_world_scale=1.0,
                 )
                 joints_smooth = self.smoother.update(joints_recon)
-                joints_np = np.array(joints_smooth, dtype=np.float64)
 
                 cog_vec = self.cog_estimator.compute(joints_smooth)
+                cog_vec = (float(cog_vec[0]), float(cog_vec[1]), float(cog_vec[2]))
                 cog_np = np.array(cog_vec, dtype=np.float64)
                 v, a = self._estimate_pose_derivative(cog_np, frame.source_timestamp)
                 self._prev_ts = frame.source_timestamp
@@ -183,7 +183,7 @@ class AnalysisEngine:
                     overlays=out_overlays,
                 )
 
-                self.prev_joints = joints_np
+                self.prev_joints = joints_recon
                 self.stats_processed += 1
                 self.latency_ms = (time.perf_counter() - start_ms) * 1000.0
 

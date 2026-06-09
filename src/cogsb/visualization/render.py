@@ -37,7 +37,11 @@ def render_video(video_path: str, jsonl_path: str, output_path: Optional[str] = 
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if fps <= 0:
             fps = 30.0
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc_func = getattr(cv2, "VideoWriter_fourcc", None)
+        if callable(fourcc_func):
+            fourcc = int(fourcc_func(*"mp4v"))
+        else:
+            fourcc = int(ord("m") | (ord("p") << 8) | (ord("4") << 16) | (ord("v") << 24))
         writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
     idx = 0

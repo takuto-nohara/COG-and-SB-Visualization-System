@@ -1,8 +1,40 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
+from types import SimpleNamespace
 
-import typer
+try:
+    import typer  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - import guard for incomplete environments
+    class _TyperFallback:
+        class BadParameter(RuntimeError):
+            pass
+
+        @staticmethod
+        def _default_arg(*args: Any, **kwargs: Any) -> Any:
+            if args:
+                return args[0]
+            return kwargs.get("default")
+
+        @staticmethod
+        def Argument(*args: Any, **kwargs: Any) -> Any:
+            return _TyperFallback._default_arg(*args, **kwargs)
+
+        @staticmethod
+        def Option(*args: Any, **kwargs: Any) -> Any:
+            return _TyperFallback._default_arg(*args, **kwargs)
+
+        class Typer:
+            def command(self, *_: Any, **__: Any):
+                def decorator(func: Any) -> Any:
+                    return func
+
+                return decorator
+
+            def __call__(self, *args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("typer is not installed")
+
+    typer = SimpleNamespace(Argument=_TyperFallback.Argument, Option=_TyperFallback.Option, BadParameter=_TyperFallback.BadParameter, Typer=_TyperFallback.Typer)  # type: ignore[assignment]
 
 from cogsb.core import PipelineConfig, PipelineMode, SourceType
 from cogsb.pipeline.engine import AnalysisEngine
@@ -27,6 +59,7 @@ def analyze(
         raise typer.BadParameter("source は live または file を指定してください")
     if source == "file" and not path:
         raise typer.BadParameter("file入力時は --path が必要です")
+    assert path is not None
 
     mode_enum = PipelineMode.REALTIME if mode == "realtime" else PipelineMode.OFFLINE
     cfg = PipelineConfig(

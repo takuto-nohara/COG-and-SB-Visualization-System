@@ -1,10 +1,132 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple, TypedDict, cast
 
 import numpy as np
-from shapely.geometry import MultiPoint, Point, Polygon
+
+try:
+    from shapely.geometry import MultiPoint, Point, Polygon  # type: ignore[import-not-found]
+    from shapely.errors import TopologicalError  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover
+    MultiPoint = cast(object, None)
+    Point = cast(object, None)
+    Polygon = cast(object, None)
+    TopologicalError = Exception
+    _SHAPELY_AVAILABLE = False
+else:
+    _SHAPELY_AVAILABLE = True
+
+
+class BOSResult(TypedDict):
+    polygon: List[Tuple[float, float]]
+    left_contact: float
+    right_contact: float
+    inside: bool
+    margin: Optional[float]
+    area: float
+    support_points: List[Tuple[float, float]]
+
+
+def _polygon_area(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if len(points) <= 1:
+        return points[:]
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return pts
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = lower[:-1] + upper[:-1]
+    return hull
+
+
+def _point_to_segment_distance(
+    point: Tuple[float, float],
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+) -> float:
+    px, py = point
+    x1, y1 = a
+    x2, y2 = b
+    vx, vy = x2 - x1, y2 - y1
+    wx, wy = px - x1, py - y1
+    seg_len2 = vx * vx + vy * vy
+    if seg_len2 == 0.0:
+        return float(np.hypot(wx, wy))
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len2))
+    proj_x = x1 + t * vx
+    proj_y = y1 + t * vy
+    return float(np.hypot(px - proj_x, py - proj_y))
+
+
+def _point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, float]]) -> bool:
+    if len(polygon) < 3:
+        return False
+    x, y = point
+    inside = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        intersects = ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1)
+        if intersects:
+            inside = not inside
+    return inside
+
+
+def _project_point_to_polygon(point: Tuple[float, float], polygon: List[Tuple[float, float]]) -> Tuple[float, float]:
+    if not polygon:
+        return point
+    if len(polygon) == 1:
+        return polygon[0]
+    if len(polygon) == 2:
+        return polygon[0]
+
+    best_point = polygon[0]
+    best_distance = _point_to_segment_distance(point, polygon[0], polygon[1])
+    for i in range(len(polygon)):
+        a = polygon[i]
+        b = polygon[(i + 1) % len(polygon)]
+        d = _point_to_segment_distance(point, a, b)
+        if d <= best_distance:
+            best_distance = d
+            x1, y1 = a
+            x2, y2 = b
+            vx, vy = x2 - x1, y2 - y1
+            wx, wy = point[0] - x1, point[1] - y1
+            seg_len2 = vx * vx + vy * vy
+            if seg_len2 == 0.0:
+                best_point = a
+            else:
+                t = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len2))
+                best_point = (x1 + t * vx, y1 + t * vy)
+
+    return best_point
 
 
 @dataclass
@@ -49,13 +171,20 @@ def _foot_contacts(pts: np.ndarray, dt: float, prev_pts: Optional[np.ndarray] = 
 
 def _foot_polygon(points: List[Tuple[float, float]], prev_polygon: Optional[List[Tuple[float, float]]]) -> Tuple[List[Tuple[float, float]], float]:
     if len(points) >= 3:
-        mp = MultiPoint(points)
-        hull = mp.convex_hull
-        if isinstance(hull, Polygon):
-            polygon = list(hull.exterior.coords)
-            if polygon and polygon[0] == polygon[-1]:
-                polygon = polygon[:-1]
-            return [(float(x), float(y)) for x, y in polygon], float(hull.area)
+        if _SHAPELY_AVAILABLE:
+            try:
+                mp = MultiPoint(points)  # type: ignore[var-undefined]
+                hull = mp.convex_hull
+                if isinstance(hull, Polygon):
+                    polygon = list(hull.exterior.coords)
+                    if polygon and polygon[0] == polygon[-1]:
+                        polygon = polygon[:-1]
+                    return [(float(x), float(y)) for x, y in polygon], float(hull.area)
+            except Exception:
+                pass
+        fallback_polygon = _convex_hull(points)
+        if len(fallback_polygon) >= 3:
+            return fallback_polygon, _polygon_area(fallback_polygon)
 
     # fallback to line segment / empty polygon
     if len(points) == 2:
@@ -67,18 +196,23 @@ def _foot_polygon(points: List[Tuple[float, float]], prev_polygon: Optional[List
     return [], 0.0
 
 
-def compute_bos(world_landmarks: List[Tuple[float, float, float]], prev_landmarks: Optional[List[Tuple[float, float, float]]] = None, prev_polygon: Optional[List[Tuple[float, float]]] = None, dt: float = 1 / 30) -> Dict[str, object]:
+def compute_bos(
+    world_landmarks: List[Tuple[float, float, float]],
+    prev_landmarks: Optional[List[Tuple[float, float, float]]] = None,
+    prev_polygon: Optional[List[Tuple[float, float]]] = None,
+    dt: float = 1 / 30,
+) -> BOSResult:
     pts = np.array(world_landmarks, dtype=np.float64) if len(world_landmarks) >= 33 else None
     if pts is None or len(world_landmarks) < 33:
-        return {
-            "polygon": prev_polygon or [],
-            "left_contact": 0.0,
-            "right_contact": 0.0,
-            "inside": False,
-            "margin": None,
-            "area": 0.0,
-            "support_points": [],
-        }
+        return BOSResult(
+            polygon=prev_polygon or [],
+            left_contact=0.0,
+            right_contact=0.0,
+            inside=False,
+            margin=None,
+            area=0.0,
+            support_points=[],
+        )
 
     prev = np.array(prev_landmarks, dtype=np.float64) if prev_landmarks is not None else None
     left_conf, right_conf = _foot_contacts(pts, dt, prev)
@@ -101,15 +235,15 @@ def compute_bos(world_landmarks: List[Tuple[float, float, float]], prev_landmark
         active = foot_points
 
     polygon_xy, area = _foot_polygon(active, prev_polygon)
-    return {
-        "polygon": polygon_xy,
-        "left_contact": left_conf,
-        "right_contact": right_conf,
-        "inside": False,
-        "margin": None,
-        "area": area,
-        "support_points": foot_points,
-    }
+    return BOSResult(
+        polygon=polygon_xy,
+        left_contact=left_conf,
+        right_contact=right_conf,
+        inside=False,
+        margin=None,
+        area=area,
+        support_points=foot_points,
+    )
 
 
 def inside_bos(point_xy: Tuple[float, float], polygon_xy: List[Tuple[float, float]]) -> Tuple[bool, Optional[float]]:
@@ -121,8 +255,21 @@ def inside_bos(point_xy: Tuple[float, float], polygon_xy: List[Tuple[float, floa
         d = float(np.hypot(point_xy[0] - polygon_xy[0][0], point_xy[1] - polygon_xy[0][1]))
         return d < 1e-6, 0.0
 
-    poly = Polygon(polygon_xy)
-    p = Point(point_xy)
-    inside = poly.contains(p) or poly.touches(p)
-    margin = float(poly.boundary.distance(p)) if inside else -float(poly.distance(p))
+    if _SHAPELY_AVAILABLE:
+        try:
+            poly = Polygon(polygon_xy)  # type: ignore[var-undefined]
+            p = Point(point_xy)  # type: ignore[var-undefined]
+            inside = poly.contains(p) or poly.touches(p)
+            margin = float(poly.boundary.distance(p)) if inside else -float(poly.distance(p))
+            return inside, margin
+        except TopologicalError:
+            pass
+
+    inside = _point_in_polygon(point_xy, polygon_xy)
+    margin = min(
+        _point_to_segment_distance(point_xy, polygon_xy[i], polygon_xy[(i + 1) % len(polygon_xy)])
+        for i in range(len(polygon_xy))
+    )
+    if not inside:
+        margin = -(abs(margin) if margin is not None else 0.0)
     return inside, margin

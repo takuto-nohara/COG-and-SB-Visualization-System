@@ -41,7 +41,8 @@ def smooth_time_derivative(vec_prev: List[Tuple[float, float, float]], vec_curr:
     b = np.array(vec_prev, dtype=np.float64)
     if dt <= 0:
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
-    vel = tuple(float(v) for v in np.mean(a - b, axis=0) / dt)
+    raw_vel = np.mean(a - b, axis=0) / dt
+    vel = (float(raw_vel[0]), float(raw_vel[1]), float(raw_vel[2]))
     # accel cannot be computed without two previous steps here; return zeros.
     acc = (0.0, 0.0, 0.0)
     return vel, acc

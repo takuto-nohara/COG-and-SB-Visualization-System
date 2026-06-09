@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import List, Optional
 
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover
+    mp = None
 import numpy as np
 
 from cogsb.core.types import Pose2D, PoseFrame
@@ -19,6 +22,8 @@ class MediaPipePoseEstimator:
         output_world: bool = True,
         output_rgb: bool = False,
     ) -> None:
+        if mp is None:
+            raise RuntimeError("mediapipe がインストールされていません。pip install mediapipe を実行してください。")
         self.pose = mp.solutions.pose.Pose(
             static_image_mode=False,
             model_complexity=model_complexity,
@@ -29,7 +34,7 @@ class MediaPipePoseEstimator:
         )
         self.output_world = output_world
         self.output_rgb = output_rgb
-        self.draw = mp.solutions.drawing_utils
+        self.draw = mp.solutions.drawing_utils  # type: ignore[assignment]
 
     def close(self) -> None:
         self.pose.close()

@@ -3,10 +3,13 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.optimize import least_squares
+try:
+    from scipy.optimize import least_squares  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover
+    least_squares = None
 
 from cogsb.core.types import PoseFrame
-from cogsb.reconstruction.body_segments import SEGMENT_TABLE, SegmentDef
+from cogsb.reconstruction.body_segments import SEGMENT_TABLE
 
 
 class SkeletonReconstructor:
@@ -56,7 +59,12 @@ class SkeletonReconstructor:
         pts, conf = self._pose_to_array(pose_frame, fallback_world_scale)
         self._segment_lengths = self._segment_target_lengths(pts, conf)
 
-    def reconstruct(self, pose_frame: PoseFrame, prev_joints: Optional[np.ndarray] = None, fallback_world_scale: float = 1.0):
+    def reconstruct(
+        self,
+        pose_frame: PoseFrame,
+        prev_joints: Optional[Sequence[Tuple[float, float, float]]] = None,
+        fallback_world_scale: float = 1.0,
+    ) -> Tuple[List[Tuple[float, float, float]], float, float]:
         if len(pose_frame.landmarks) == 0:
             return [], 0.0, 1.0
 
@@ -72,6 +80,14 @@ class SkeletonReconstructor:
         def unpack(x: np.ndarray) -> np.ndarray:
             return x.reshape((n, 3))
 
+        if least_squares is None:
+            refined = joints
+            residual = 0.0
+            scale = float(np.linalg.norm(refined - joints))
+            return [tuple(float(v) for v in row) for row in refined], residual, scale
+
+        prev_np = np.array(prev_joints, dtype=np.float64) if prev_joints is not None else None
+
         def residuals(x: np.ndarray) -> np.ndarray:
             p = unpack(x)
             res = []
@@ -79,7 +95,7 @@ class SkeletonReconstructor:
             # observation residual
             obs = (p - joints).reshape(-1)
             obs_w = np.repeat(confidences, 3)
-            res.append(self.damping * np.sqrt(obs_w) * obs)
+            res.append(np.atleast_1d(self.damping * np.sqrt(obs_w) * obs))
 
             # segment length residuals
             for seg_name, length in segment_targets.items():
@@ -91,15 +107,15 @@ class SkeletonReconstructor:
                 cur_len = np.linalg.norm(pb - pa)
                 if cur_len <= 1e-8:
                     continue
-                res.append((cur_len - length) * self.length_weight)
+                res.append(np.atleast_1d((cur_len - length) * self.length_weight))
 
             # temporal smoothness
-            if prev_joints is not None and prev_joints.shape == p.shape:
-                res.append(self.smooth_weight * (p - prev_joints).reshape(-1))
-            return np.concatenate([np.atleast_1d(r) for r in res if r is not None])
+            if prev_np is not None and prev_np.shape == p.shape:
+                res.append(np.atleast_1d(self.smooth_weight * (p - prev_np).reshape(-1)))
+            return np.concatenate([r for r in res if r is not None])
 
         try:
-            result = least_squares(
+            result = least_squares(  # type: ignore[misc]
                 residuals,
                 x0,
                 method="trf",
