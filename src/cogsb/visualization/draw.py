@@ -373,7 +373,7 @@ def _project_scene_point(
     cx_px = width * 0.5
     cy_px = height * 0.5
     px = cx_px + (x2 + z2 * 0.35) * (scale * zoom) + pan_x
-    py = cy_px + (-y2 - z2 * 0.20) * (scale * zoom) + pan_y
+    py = cy_px + (y2 - z2 * 0.20) * (scale * zoom) + pan_y
     return (
         (
             max(0, min(width - 1, int(round(px)))),
