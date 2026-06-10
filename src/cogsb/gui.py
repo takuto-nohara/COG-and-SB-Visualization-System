@@ -302,12 +302,19 @@ class COGSBGUI:
         max_h = max(1, view_h)
 
         h, w = frame_to_show.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
+        scale_limit = max_w / w if is_main else min(max_w / w, 1.0)
+        scale = min(max_w / w, max_h / h, scale_limit)
         if scale < 1.0:
             frame_to_show = cv2.resize(
                 frame_to_show,
                 (max(1, int(w * scale)), max(1, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
+            )
+        elif scale > 1.0:
+            frame_to_show = cv2.resize(
+                frame_to_show,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_CUBIC,
             )
 
         encode_ok, png_data = cv2.imencode(".png", frame_to_show)
