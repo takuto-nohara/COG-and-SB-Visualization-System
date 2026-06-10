@@ -26,6 +26,13 @@ python -m pip install -e .[analysis]
 cogsb analyze --source live --source-id 0 --mode realtime
 ```
 
+### 1コマンド起動
+```bash
+python -m pip install -e .
+cogsb-start
+```
+`cogsb-start` はライブ映像を `--source live --source-id 0 --mode realtime` で起動します。
+
 ### 録画入力（mp4）
 ```bash
 cogsb analyze --source file --path sample.mp4 --mode offline --output-dir outputs\run01

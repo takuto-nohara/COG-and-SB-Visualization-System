@@ -24,6 +24,7 @@ analysis = [
 
 [project.scripts]
 cogsb = "cogsb.cli:main"
+cogsb-start = "cogsb.cli.start:main"
 
 [build-system]
 requires = ["setuptools>=69"]
