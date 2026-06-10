@@ -141,7 +141,7 @@ class COGSBGUI:
         ttk.Label(render_mode_row, text="描画モード").pack(side=tk.LEFT)
         for value, caption in (
             (RENDER_MODE_OVERLAY, "画像重ね"),
-            (RENDER_MODE_SPACE3D, "3D空間"),
+            (RENDER_MODE_SPACE3D, "3D空間（β）"),
         ):
             radio = ttk.Radiobutton(
                 render_mode_row,
