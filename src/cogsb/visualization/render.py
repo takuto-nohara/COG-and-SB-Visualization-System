@@ -7,6 +7,7 @@ from typing import Dict, Optional
 import cv2
 
 from cogsb.visualization import draw_frame_overlay
+from cogsb.visualization.draw import RENDER_MODE_OVERLAY, RENDER_MODE_OPTIONS
 
 
 def load_overlay_json(path: str) -> Dict[int, dict]:
@@ -24,8 +25,17 @@ def load_overlay_json(path: str) -> Dict[int, dict]:
     return overlays
 
 
-def render_video(video_path: str, jsonl_path: str, output_path: Optional[str] = None, window_name: str = "cogsb"):
+def render_video(
+    video_path: str,
+    jsonl_path: str,
+    output_path: Optional[str] = None,
+    window_name: str = "cogsb",
+    render_mode: str = RENDER_MODE_OVERLAY,
+):
     overlays = load_overlay_json(jsonl_path)
+    render_mode = render_mode.lower()
+    if render_mode not in RENDER_MODE_OPTIONS:
+        render_mode = RENDER_MODE_OVERLAY
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"動画を開けませんでした: {video_path}")
@@ -51,7 +61,7 @@ def render_video(video_path: str, jsonl_path: str, output_path: Optional[str] = 
             break
 
         if idx in overlays:
-            frame = draw_frame_overlay(frame, overlays[idx])
+            frame = draw_frame_overlay(frame, overlays[idx], render_mode=render_mode)
 
         if writer is not None:
             writer.write(frame)

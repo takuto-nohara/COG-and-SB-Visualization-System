@@ -17,7 +17,7 @@ from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
 from cogsb.sources import LiveCameraSource, RecordedImageSource, RecordedVideoSource
-from cogsb.visualization.draw import draw_frame_overlay
+from cogsb.visualization.draw import RENDER_MODE_OPTIONS, RENDER_MODE_OVERLAY, RENDER_MODE_SPACE3D, draw_frame_overlay
 
 
 class COGSBGUI:
@@ -30,6 +30,8 @@ class COGSBGUI:
 
         self.source_var = tk.StringVar(value="image")
         self.source_path_var = tk.StringVar()
+        self.render_mode_var = tk.StringVar(value=RENDER_MODE_OVERLAY)
+        self.render_mode_radios: list[ttk.Radiobutton] = []
         self.camera_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="起動準備完了")
         self.info_var = tk.StringVar(value="")
@@ -39,6 +41,24 @@ class COGSBGUI:
         self._stop_event = threading.Event()
         self._queue: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=12)
         self._last_output_path = Path("outputs")
+        self._latest_render_frame: Optional[Any] = None
+        self._latest_render_output = None
+        self._space3d_view = {
+            "yaw": -40.0,
+            "pitch": 22.0,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        }
+        self._space3d_drag = {
+            "mode": None,
+            "start_x": 0,
+            "start_y": 0,
+            "base_yaw": -40.0,
+            "base_pitch": 22.0,
+            "base_pan_x": 0.0,
+            "base_pan_y": 0.0,
+        }
 
         self._build_ui()
         self._queue_poll()
@@ -99,6 +119,27 @@ class COGSBGUI:
         self.stop_btn = ttk.Button(button_row, text="停止", command=self._stop_analysis, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
 
+        render_mode_row = ttk.Frame(controls)
+        render_mode_row.pack(fill=tk.X, padx=8, pady=(4, 6))
+        ttk.Label(render_mode_row, text="描画モード").pack(side=tk.LEFT)
+        for value, caption in (
+            (RENDER_MODE_OVERLAY, "画像重ね"),
+            (RENDER_MODE_SPACE3D, "3D空間"),
+        ):
+            radio = ttk.Radiobutton(
+                render_mode_row,
+                text=caption,
+                value=value,
+                variable=self.render_mode_var,
+                command=self._on_render_mode_change,
+            )
+            radio.pack(side=tk.LEFT, padx=(8, 4))
+            self.render_mode_radios.append(radio)
+
+        reset_row = ttk.Frame(controls)
+        reset_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(reset_row, text="3D視点リセット", command=self._reset_space3d_view).pack(side=tk.LEFT)
+
         status_row = ttk.Frame(controls)
         status_row.pack(fill=tk.X, padx=8, pady=(4, 2))
         ttk.Label(status_row, text="状態:").pack(side=tk.LEFT)
@@ -129,11 +170,20 @@ class COGSBGUI:
         )
 
         preview = ttk.LabelFrame(
-            preview_area, text="解析結果プレビュー（重心・支持基底面・圧中心点を重畳表示）"
+            preview_area, text="解析結果プレビュー（2D重ね合わせ / 3D空間表示）"
         )
         preview.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(preview, bg="#111111", width=1024, height=576, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_rotate_start)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_drag_end)
+        self.canvas.bind("<ButtonPress-3>", self._on_canvas_pan_start)
+        self.canvas.bind("<B3-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-3>", self._on_canvas_drag_end)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-4>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-5>", self._on_canvas_wheel)
 
         self._toggle_controls()
 
@@ -403,9 +453,22 @@ class COGSBGUI:
             if frame is None:
                 raise ValueError("描画フレームを取得できませんでした。")
 
+            source_frame = frame.copy()
             frame_h, frame_w = frame.shape[:2]
             overlay = self._to_overlay(output, (frame_h, frame_w))
-            frame = draw_frame_overlay(frame, overlay)
+            render_mode = self.render_mode_var.get()
+            if render_mode not in RENDER_MODE_OPTIONS:
+                render_mode = RENDER_MODE_OVERLAY
+            render_state = self._space3d_view if render_mode == RENDER_MODE_SPACE3D else None
+            frame = draw_frame_overlay(
+                source_frame,
+                overlay,
+                render_mode=render_mode,
+                render_state=render_state,
+            )
+
+            self._latest_render_frame = source_frame
+            self._latest_render_output = output
 
             self.canvas.update_idletasks()
             view_w = self.canvas.winfo_width()
@@ -441,11 +504,94 @@ class COGSBGUI:
             self.status_var.set("描画エラー")
             self.root.after(0, lambda: messagebox.showerror("描画エラー", str(exc)))
 
+    def _on_render_mode_change(self) -> None:
+        self._redraw_latest_frame()
+
+    def _reset_space3d_view(self) -> None:
+        self._space3d_view = {
+            "yaw": -40.0,
+            "pitch": 22.0,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        }
+        self._redraw_latest_frame()
+
+    def _redraw_latest_frame(self) -> None:
+        if self._latest_render_frame is None or self._latest_render_output is None:
+            return
+        self._render_frame(self._latest_render_frame, self._latest_render_output)
+
+    def _on_canvas_rotate_start(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+        self._space3d_drag["mode"] = "rotate"
+        self._space3d_drag["start_x"] = event.x
+        self._space3d_drag["start_y"] = event.y
+        self._space3d_drag["base_yaw"] = self._space3d_view["yaw"]
+        self._space3d_drag["base_pitch"] = self._space3d_view["pitch"]
+
+    def _on_canvas_pan_start(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+        self._space3d_drag["mode"] = "pan"
+        self._space3d_drag["start_x"] = event.x
+        self._space3d_drag["start_y"] = event.y
+        self._space3d_drag["base_pan_x"] = self._space3d_view["pan_x"]
+        self._space3d_drag["base_pan_y"] = self._space3d_view["pan_y"]
+
+    def _on_canvas_drag(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+        mode = self._space3d_drag.get("mode")
+        if mode is None:
+            return
+
+        dx = float(event.x - self._space3d_drag["start_x"])
+        dy = float(event.y - self._space3d_drag["start_y"])
+
+        if mode == "rotate":
+            yaw = self._space3d_drag["base_yaw"] + dx * 0.35
+            pitch = self._space3d_drag["base_pitch"] - dy * 0.35
+            pitch = max(-85.0, min(85.0, pitch))
+            self._space3d_view["yaw"] = yaw
+            self._space3d_view["pitch"] = pitch
+        elif mode == "pan":
+            self._space3d_view["pan_x"] = self._space3d_drag["base_pan_x"] + dx
+            self._space3d_view["pan_y"] = self._space3d_drag["base_pan_y"] + dy
+
+        self._redraw_latest_frame()
+
+    def _on_canvas_drag_end(self, event: tk.Event[tk.Misc]) -> None:
+        self._space3d_drag["mode"] = None
+
+    def _on_canvas_wheel(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+
+        delta = 0
+        if hasattr(event, "num") and event.num in (4, 5):
+            delta = 1 if event.num == 4 else -1
+        else:
+            if hasattr(event, "delta") and event.delta != 0:
+                delta = 1 if event.delta > 0 else -1
+
+        if delta == 0:
+            return
+
+        factor = 1.12 if delta > 0 else 0.89
+        zoom = self._space3d_view["zoom"] * factor
+        self._space3d_view["zoom"] = max(0.08, min(6.0, zoom))
+        self._redraw_latest_frame()
+
     def _set_controls(self, running: bool) -> None:
         state = tk.DISABLED if running else tk.NORMAL
         self.start_btn.config(state=state)
         self.browse_btn.config(state=tk.DISABLED if running or self.source_var.get() == "live" else tk.NORMAL)
         self.path_entry.config(state=tk.DISABLED if self.source_var.get() == "live" or running else tk.NORMAL)
+        radio_state = tk.DISABLED if running else tk.NORMAL
+        for radio in self.render_mode_radios:
+            radio.config(state=radio_state)
         if running:
             self.stop_btn.config(state=tk.NORMAL)
             self.camera_entry.config(state=tk.NORMAL if self.source_var.get() == "live" else tk.DISABLED)
