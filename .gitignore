@@ -1,2 +1,3 @@
 # Core build/tooling files for repository.
 cogsb.egg-info
+__pycache__
