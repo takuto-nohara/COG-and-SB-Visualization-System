@@ -4,7 +4,7 @@
 ライブ映像と録画動画のどちらでも解析できるよう設計したPython実装です。
 
 ## 特徴
-- 入力: ライブカメラ(`--source live`) / 録画動画(`--source file --path`)対応
+- 入力: ライブカメラ(`--source live`) / 録画動画(`--source file --path`) / 静止画(`--source image --path`)対応
 - 推定: MediaPipe Pose
 - 再構成: 体節長固定の骨格最適化（セグメント拘束 + 時系列平滑）
 - 重心: Dempster/de Leva系係数によるセグメント合成
@@ -29,6 +29,11 @@ cogsb analyze --source live --source-id 0 --mode realtime
 ### 録画入力（mp4）
 ```bash
 cogsb analyze --source file --path sample.mp4 --mode offline --output-dir outputs\run01
+```
+
+### 写真入力（jpg/png）
+```bash
+cogsb analyze --source image --path sample.jpg --mode offline --output-dir outputs\run_image
 ```
 
 ### 出力

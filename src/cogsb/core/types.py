@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 class SourceType(str, Enum):
     LIVE = "live"
     FILE = "file"
+    IMAGE = "image"
 
 
 class PipelineMode(str, Enum):

@@ -16,6 +16,7 @@ class MediaPipePoseEstimator:
     def __init__(
         self,
         model_complexity: int = 1,
+        static_image_mode: bool = False,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
         smooth_landmarks: bool = True,
@@ -25,7 +26,7 @@ class MediaPipePoseEstimator:
         if mp is None:
             raise RuntimeError("mediapipe がインストールされていません。pip install mediapipe を実行してください。")
         self.pose = mp.solutions.pose.Pose(
-            static_image_mode=False,
+            static_image_mode=static_image_mode,
             model_complexity=model_complexity,
             enable_segmentation=False,
             min_detection_confidence=min_detection_confidence,

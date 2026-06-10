@@ -40,13 +40,13 @@ from cogsb.core import PipelineConfig, PipelineMode, SourceType
 from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
-from cogsb.sources import LiveCameraSource, RecordedVideoSource
+from cogsb.sources import LiveCameraSource, RecordedImageSource, RecordedVideoSource
 from cogsb.visualization.render import render_video
 
 
 def analyze(
-    source: str = typer.Argument("file", help="live または file"),
-    path: Optional[str] = typer.Option(None, help="録画ファイルのパス（source=file時必須）"),
+    source: str = typer.Argument("file", help="live / file / image"),
+    path: Optional[str] = typer.Option(None, help="入力メディアのパス（source=file/image時必須）"),
     source_id: int = typer.Option(0, help="ライブ入力のデバイスID"),
     mode: str = typer.Option("realtime", help="realtime または offline"),
     max_frames: Optional[int] = typer.Option(None, help="最大処理フレーム数"),
@@ -55,16 +55,23 @@ def analyze(
     smpl_model: Optional[str] = typer.Option(None, help="SMPLモデルディレクトリ（任意）"),
     enable_smpl: bool = typer.Option(False, help="SMPLフィッティングを有効化"),
 ) -> None:
-    if source not in {"live", "file"}:
-        raise typer.BadParameter("source は live または file を指定してください")
-    if source == "file" and not path:
-        raise typer.BadParameter("file入力時は --path が必要です")
+    if source not in {"live", "file", "image"}:
+        raise typer.BadParameter("source は live / file / image を指定してください")
+    if source in {"file", "image"} and not path:
+        raise typer.BadParameter("file/image入力時は --path が必要です")
     assert path is not None
 
     mode_enum = PipelineMode.REALTIME if mode == "realtime" else PipelineMode.OFFLINE
+    if source == "live":
+        source_type = SourceType.LIVE
+    elif source == "file":
+        source_type = SourceType.FILE
+    else:
+        source_type = SourceType.IMAGE
+
     cfg = PipelineConfig(
         mode=mode_enum,
-        source_type=SourceType.LIVE if source == "live" else SourceType.FILE,
+        source_type=source_type,
         output_dir=output_dir,
         max_frames=max_frames,
         smpl_enabled=enable_smpl,
@@ -73,10 +80,12 @@ def analyze(
 
     if source == "live":
         source_obj = LiveCameraSource(camera_index=source_id, output_rgb=False)
-    else:
+    elif source == "file":
         source_obj = RecordedVideoSource(video_path=path, output_rgb=False)
+    else:
+        source_obj = RecordedImageSource(image_path=path, output_rgb=False)
 
-    estimator = MediaPipePoseEstimator(output_rgb=False)
+    estimator = MediaPipePoseEstimator(output_rgb=False, static_image_mode=source == "image")
     smpl_fitter = SMPLFitter(
         enabled=enable_smpl,
         model_path=smpl_model,
