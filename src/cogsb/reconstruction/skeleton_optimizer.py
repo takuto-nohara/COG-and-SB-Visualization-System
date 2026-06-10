@@ -13,10 +13,17 @@ from cogsb.reconstruction.body_segments import SEGMENT_TABLE
 
 
 class SkeletonReconstructor:
-    def __init__(self, damping: float = 0.15, length_weight: float = 4.0, smooth_weight: float = 1.0):
+    def __init__(
+        self,
+        damping: float = 0.15,
+        length_weight: float = 4.0,
+        smooth_weight: float = 1.0,
+        velocity_weight: float = 0.18,
+    ):
         self.damping = damping
         self.length_weight = length_weight
         self.smooth_weight = smooth_weight
+        self.velocity_weight = velocity_weight
         self._segment_lengths: Dict[str, float] = {}
 
     def _pose_to_array(self, pose_frame: PoseFrame, fallback_world_scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
@@ -63,7 +70,9 @@ class SkeletonReconstructor:
         self,
         pose_frame: PoseFrame,
         prev_joints: Optional[Sequence[Tuple[float, float, float]]] = None,
+        prev_velocity: Optional[Sequence[Tuple[float, float, float]]] = None,
         fallback_world_scale: float = 1.0,
+        dt: float = 1.0 / 30.0,
     ) -> Tuple[List[Tuple[float, float, float]], float, float]:
         if len(pose_frame.landmarks) == 0:
             return [], 0.0, 1.0
@@ -87,6 +96,8 @@ class SkeletonReconstructor:
             return [tuple(float(v) for v in row) for row in refined], residual, scale
 
         prev_np = np.array(prev_joints, dtype=np.float64) if prev_joints is not None else None
+        dt = float(dt) if dt and dt > 0 else 1.0 / 30.0
+        prev_vel_np = np.array(prev_velocity, dtype=np.float64) if prev_velocity is not None else None
 
         def residuals(x: np.ndarray) -> np.ndarray:
             p = unpack(x)
@@ -112,6 +123,11 @@ class SkeletonReconstructor:
             # temporal smoothness
             if prev_np is not None and prev_np.shape == p.shape:
                 res.append(np.atleast_1d(self.smooth_weight * (p - prev_np).reshape(-1)))
+
+            if prev_vel_np is not None and prev_vel_np.shape == p.shape:
+                predicted = prev_np + prev_vel_np * dt
+                res.append(np.atleast_1d(self.velocity_weight * (p - predicted).reshape(-1)))
+
             return np.concatenate([r for r in res if r is not None])
 
         try:

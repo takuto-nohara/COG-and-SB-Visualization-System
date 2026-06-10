@@ -417,6 +417,18 @@ class COGSBGUI:
                 for lm in output.pose.world_landmarks
             ]
 
+        if output.reconstructed is not None and output.reconstructed.joints_smooth:
+            payload["pose"]["pose3d_joints"] = [
+                {
+                    "x": float(x),
+                    "y": float(y),
+                    "z": float(z),
+                    "visibility": 1.0,
+                }
+                for x, y, z in output.reconstructed.joints_smooth
+            ]
+            payload["pose"]["pose3d_residual"] = float(output.reconstructed.optimization_residual)
+
         return payload
 
     @staticmethod

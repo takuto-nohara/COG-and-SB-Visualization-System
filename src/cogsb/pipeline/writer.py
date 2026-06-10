@@ -35,6 +35,7 @@ class FrameWriter:
             "source_type": frame_output.source_type.value,
             "mode": frame_output.mode.value,
             "pose": _normalize(frame_output.pose),
+            "reconstructed": _normalize(frame_output.reconstructed),
             "cog": _normalize(frame_output.cog),
             "bos": _normalize(frame_output.bos),
             "cop": _normalize(frame_output.cop),

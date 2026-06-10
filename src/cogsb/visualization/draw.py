@@ -251,6 +251,20 @@ def _collect_world_points_for_3d(
     if pose is None:
         return []
 
+    raw_pose3d = pose.get("pose3d_joints")
+    if raw_pose3d is None:
+        reconstructed = overlay.get("reconstructed")
+        if isinstance(reconstructed, Mapping):
+            raw_pose3d = reconstructed.get("joints_smooth")
+            if raw_pose3d is None:
+                raw_pose3d = reconstructed.get("joints_world")
+    if isinstance(raw_pose3d, list) and raw_pose3d:
+        points = []
+        for item in raw_pose3d:
+            point = _as_point3_with_visibility(item)
+            points.append(point)
+        return points
+
     raw_world = pose.get("world_landmarks")
     if isinstance(raw_world, list) and raw_world:
         points: list[Optional[Tuple[float, float, float, Optional[float]]]] = []
