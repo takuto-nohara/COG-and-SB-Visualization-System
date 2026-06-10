@@ -42,6 +42,7 @@ from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
 from cogsb.sources import LiveCameraSource, RecordedImageSource, RecordedVideoSource
 from cogsb.visualization.render import render_video
+from cogsb.visualization.draw import RENDER_MODE_OPTIONS
 
 
 def analyze(
@@ -105,8 +106,13 @@ def visualize(
     video_path: str = typer.Argument(..., help="可視化対象の動画パス"),
     jsonl: str = typer.Argument(..., help="Analyze時に生成された outputs/frames.jsonl"),
     output: Optional[str] = typer.Option(None, help="出力mp4のパス（未指定なら即時表示）"),
+    render_mode: str = typer.Option("overlay", help="描画モード: overlay（画像重畳）または space3d（3D表示）"),
 ) -> None:
-    render_video(video_path=video_path, jsonl_path=jsonl, output_path=output)
+    mode = str(render_mode).lower()
+    if mode not in RENDER_MODE_OPTIONS:
+        raise typer.BadParameter("render-mode は overlay または space3d を指定してください")
+
+    render_video(video_path=video_path, jsonl_path=jsonl, output_path=output, render_mode=mode)
 
 
 def main() -> None:

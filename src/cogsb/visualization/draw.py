@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from cogsb.reconstruction.body_segments import SEGMENT_TABLE
 
 
 _POSE_EDGES = [
@@ -11,6 +14,24 @@ _POSE_EDGES = [
     (16, 18), (18, 20), (11, 12), (11, 23), (12, 24), (23, 25), (25, 27),
     (27, 29), (29, 31), (24, 26), (26, 28), (28, 30), (30, 32),
 ]
+
+RENDER_MODE_OVERLAY = "overlay"
+RENDER_MODE_SPACE3D = "space3d"
+RENDER_MODE_OPTIONS = {RENDER_MODE_OVERLAY, RENDER_MODE_SPACE3D}
+_GROUND_FOOT_LANDMARKS = (27, 28, 29, 30, 31, 32)
+SPACE3D_GIZMO_SIZE = 126
+SPACE3D_GIZMO_MARGIN = 10
+SPACE3D_GIZMO_HANDLE_RADIUS = 11
+_SPACE3D_GIZMO_MIN_SIZE = 56
+_GROUND_UP_HINT_PAIRS = (
+    (23, 24),  # hips
+    (11, 12),  # shoulders
+    (27, 28),  # ankles
+)
+_GROUND_SIDE_HINT_PAIRS = (
+    (23, 24),  # hips
+    (11, 12),  # shoulders
+)
 
 
 def _as_float(v: object) -> Optional[float]:
@@ -44,6 +65,34 @@ def _as_point(value: Any) -> Optional[Tuple[float, float]]:
     if x is None or y is None:
         return None
     return x, y
+
+
+def _as_point3(value: Any) -> Optional[Tuple[float, float, float]]:
+    if isinstance(value, Mapping):
+        x = _as_float(value.get("x"))
+        y = _as_float(value.get("y"))
+        z = _as_float(value.get("z"))
+        if x is None or y is None or z is None:
+            return None
+        return x, y, z
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    x = _as_float(value[0])
+    y = _as_float(value[1])
+    z = _as_float(value[2])
+    if x is None or y is None or z is None:
+        return None
+    return x, y, z
+
+
+def _as_point3_with_visibility(value: Any) -> Optional[Tuple[float, float, float, Optional[float]]]:
+    point = _as_point3(value)
+    if point is None:
+        return None
+    visibility = None
+    if isinstance(value, Mapping):
+        visibility = _as_float(value.get("visibility"))
+    return point[0], point[1], point[2], visibility
 
 
 def _world_to_pixel(point: Tuple[float, float], width: int, height: int) -> Tuple[int, int]:
@@ -199,7 +248,684 @@ def _cop_point(value: Any) -> Optional[Tuple[float, float]]:
     return _as_point(value)
 
 
-def draw_frame_overlay(frame, overlay):
+def _collect_world_points_for_3d(
+    overlay: Mapping[str, Any],
+) -> list[Optional[Tuple[float, float, float, Optional[float]]]]:
+    pose = overlay.get("pose") if isinstance(overlay.get("pose"), Mapping) else None
+    if pose is None:
+        return []
+
+    raw_pose3d = pose.get("pose3d_joints")
+    if raw_pose3d is None:
+        reconstructed = overlay.get("reconstructed")
+        if isinstance(reconstructed, Mapping):
+            raw_pose3d = reconstructed.get("joints_smooth")
+            if raw_pose3d is None:
+                raw_pose3d = reconstructed.get("joints_world")
+    if isinstance(raw_pose3d, list) and raw_pose3d:
+        points = []
+        for item in raw_pose3d:
+            point = _as_point3_with_visibility(item)
+            points.append(point)
+        return points
+
+    raw_world = pose.get("world_landmarks")
+    if isinstance(raw_world, list) and raw_world:
+        points: list[Optional[Tuple[float, float, float, Optional[float]]]] = []
+        for item in raw_world:
+            point = _as_point3_with_visibility(item)
+            points.append(point)
+        return points
+
+    raw_landmarks = pose.get("landmarks")
+    points2 = []
+    if isinstance(raw_landmarks, list):
+        for item in raw_landmarks:
+            point = _as_point(item)
+            if point is None:
+                points2.append(None)
+                continue
+            visibility = None
+            if isinstance(item, Mapping):
+                visibility = _as_float(item.get("visibility"))
+            points2.append((point[0], point[1], 0.0, visibility))
+    return points2
+
+
+def _resolve_world_point(
+    points: list[Optional[Tuple[float, float, float, Optional[float]]]],
+    idx: int,
+    *,
+    require_visible: bool = False,
+) -> Optional[Tuple[float, float, float]]:
+    if idx < 0 or idx >= len(points):
+        return None
+    item = points[idx]
+    if item is None:
+        return None
+    x, y, z, visibility = item
+    if require_visible and visibility is not None and visibility < 0.2:
+        return None
+    return x, y, z
+
+
+def _average_points(
+    points: list[Optional[Tuple[float, float, float, Optional[float]]]],
+    indices: Tuple[int, ...],
+) -> Optional[Tuple[float, float, float]]:
+    values = [p for p in (_resolve_world_point(points, idx, require_visible=False) for idx in indices) if p is not None]
+    if not values:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    return float(arr[:, 0].mean()), float(arr[:, 1].mean()), float(arr[:, 2].mean())
+
+
+def _segment_center_point(
+    points: list[Optional[Tuple[float, float, float, Optional[float]]]],
+    segment: Any,
+) -> Optional[Tuple[float, float, float]]:
+    start = _average_points(points, segment.start)
+    end = _average_points(points, segment.end)
+    if start is None or end is None:
+        return None
+    return (
+        start[0] + segment.alpha * (end[0] - start[0]),
+        start[1] + segment.alpha * (end[1] - start[1]),
+        start[2] + segment.alpha * (end[2] - start[2]),
+    )
+
+
+def _normalized_vector(vec: np.ndarray) -> Optional[np.ndarray]:
+    norm = float(np.linalg.norm(vec))
+    if not np.isfinite(norm) or norm <= 0.0:
+        return None
+    return vec / norm
+
+
+def _rotation_to_align_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    src = _normalized_vector(np.asarray(source, dtype=np.float64))
+    dst = _normalized_vector(np.asarray(target, dtype=np.float64))
+    if src is None or dst is None:
+        return np.eye(3, dtype=np.float64)
+
+    dot = float(np.dot(src, dst))
+    if dot >= 1.0:
+        return np.eye(3, dtype=np.float64)
+    if dot <= -1.0:
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(src[0]) > 0.9:
+            axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        axis = _normalized_vector(axis - np.dot(axis, src) * src)
+        if axis is None:
+            axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return 2.0 * np.outer(axis, axis) - np.eye(3, dtype=np.float64)
+
+    cross = np.cross(src, dst)
+    s = float(np.linalg.norm(cross))
+    if s <= 0.0:
+        return np.eye(3, dtype=np.float64)
+    k = cross / s
+    kx, ky, kz = k
+    K = np.array(
+        [
+            [0.0, -kz, ky],
+            [kz, 0.0, -kx],
+            [-ky, kx, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return (
+        np.eye(3, dtype=np.float64)
+        + K
+        + np.dot(K, K) * ((1.0 - dot) / (s * s))
+    )
+
+
+def _estimate_ground_alignment(
+    points: list[Optional[Tuple[float, float, float, Optional[float]]]],
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    support_points: list[Tuple[float, float, float]] = []
+
+    for idx in _GROUND_FOOT_LANDMARKS:
+        raw = _resolve_world_point(points, idx, require_visible=True)
+        if raw is not None:
+            support_points.append(raw)
+
+    if len(support_points) < 3:
+        for idx in _GROUND_FOOT_LANDMARKS:
+            raw = _resolve_world_point(points, idx, require_visible=False)
+            if raw is not None and raw not in support_points:
+                support_points.append(raw)
+
+    if len(support_points) < 3:
+        return None
+
+    arr = np.asarray(support_points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return None
+
+    centroid = arr.mean(axis=0)
+    centered = arr - centroid
+    if centered.shape[0] < 3:
+        return None
+
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if singular_values.size < 3:
+        return None
+
+    planar_ratio = float(singular_values[-1] / (np.sum(singular_values) + 1e-12))
+    if not np.isfinite(planar_ratio) or planar_ratio > 0.35:
+        return None
+
+    normal = vh[2]
+    normal = _normalized_vector(normal)
+    if normal is None:
+        return None
+
+    up_hint: list[Tuple[float, float, float]] = []
+    for a, b in _GROUND_UP_HINT_PAIRS:
+        p1 = _resolve_world_point(points, a, require_visible=False)
+        p2 = _resolve_world_point(points, b, require_visible=False)
+        if p1 is not None and p2 is not None:
+            up_hint.append((p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]))
+
+    if up_hint:
+        up_hint_vec = np.asarray(up_hint, dtype=np.float64).mean(axis=0)
+        up_norm = _normalized_vector(up_hint_vec)
+        if up_norm is not None and np.dot(normal, up_norm) < 0.0:
+            normal = -normal
+
+    target_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    up_axis = _rotation_to_align_vectors(normal, target_up) @ normal
+    up_axis = _normalized_vector(up_axis)
+    if up_axis is None:
+        up_axis = target_up
+
+    # Build an XYZ frame: X right, Y up, Z forward on the estimated ground.
+    # Forward hint: head -> hip midpoint, projected onto ground.
+    head = _resolve_world_point(points, 0, require_visible=False)
+    hip_mid = _average_points(points, (23, 24))
+    forward_hint: Optional[np.ndarray] = None
+    if head is not None and hip_mid is not None:
+        forward_hint = np.array(
+            (head[0] - hip_mid[0], head[1] - hip_mid[1], head[2] - hip_mid[2]),
+            dtype=np.float64,
+        )
+
+    if forward_hint is None:
+        shoulder_mid = _average_points(points, (11, 12))
+        if shoulder_mid is not None and hip_mid is not None:
+            forward_hint = np.array(
+                (shoulder_mid[0] - hip_mid[0], shoulder_mid[1] - hip_mid[1], shoulder_mid[2] - hip_mid[2]),
+                dtype=np.float64,
+            )
+
+    if forward_hint is None:
+        forward_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward_hint = forward_hint - np.dot(forward_hint, up_axis) * up_axis
+    forward_axis = _normalized_vector(forward_hint)
+    if forward_axis is None:
+        forward_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    right_axis = None
+    for start_idx, end_idx in _GROUND_SIDE_HINT_PAIRS:
+        p_start = _resolve_world_point(points, start_idx, require_visible=False)
+        p_end = _resolve_world_point(points, end_idx, require_visible=False)
+        if p_start is None or p_end is None:
+            continue
+        candidate = np.array(
+            (p_end[0] - p_start[0], p_end[1] - p_start[1], p_end[2] - p_start[2]),
+            dtype=np.float64,
+        )
+        candidate = candidate - np.dot(candidate, up_axis) * up_axis
+        right_axis = _normalized_vector(candidate)
+        if right_axis is not None:
+            break
+
+    if right_axis is None:
+        right_axis = _normalized_vector(np.cross(up_axis, forward_axis))
+    if right_axis is None:
+        right_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    forward_axis = np.cross(right_axis, up_axis)
+    forward_axis = _normalized_vector(forward_axis)
+    if forward_axis is None:
+        forward_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    # Rows are destination axes. transformed = R * (point - origin) -> [X,Y,Z].
+    rotation = np.vstack([right_axis, up_axis, forward_axis])
+    return rotation.astype(np.float64), centroid
+
+
+def _apply_ground_alignment(
+    point: Tuple[float, float, float],
+    alignment: Optional[tuple[np.ndarray, np.ndarray]],
+    *,
+    project_to_ground: bool = False,
+) -> Tuple[float, float, float]:
+    if alignment is None:
+        return point
+    rotation, origin = alignment
+    mapped = rotation @ (np.asarray(point, dtype=np.float64) - origin)
+    if project_to_ground:
+        return float(mapped[0]), 0.0, float(mapped[2])
+    return float(mapped[0]), float(mapped[1]), float(mapped[2])
+
+
+def _rotate_point(point: Tuple[float, float, float], yaw: float, pitch: float) -> Tuple[float, float, float]:
+    x, y, z = point
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+    x2 = x * cos_y + z * sin_y
+    z2 = -x * sin_y + z * cos_y
+    cos_p = math.cos(pitch)
+    sin_p = math.sin(pitch)
+    y2 = y * cos_p - z2 * sin_p
+    z2 = y * sin_p + z2 * cos_p
+    return x2, y2, z2
+
+
+def _scene_transform(points: list[Tuple[float, float, float]], width: int, height: int) -> Tuple[Tuple[float, float, float], float]:
+    if not points:
+        return (0.0, 0.0, 0.0), 1.0
+    arr = np.asarray(points, dtype=np.float64)
+    min_v = np.min(arr, axis=0)
+    max_v = np.max(arr, axis=0)
+    center = ((min_v + max_v) / 2.0).tolist()
+    span = float(max(np.max(max_v - min_v), 1e-6))
+    scale = min(width, height) * 0.35 / span
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return (float(center[0]), float(center[1]), float(center[2])), scale
+
+
+def _coerce_render_state(
+    render_state: Optional[Mapping[str, Any]],
+    key: str,
+    default: float,
+) -> float:
+    value = default
+    if render_state is not None:
+        raw = render_state.get(key)
+        parsed = _as_float(raw)
+        if parsed is not None:
+            value = parsed
+    return value
+
+
+def _project_scene_point(
+    point: Tuple[float, float, float],
+    width: int,
+    height: int,
+    center: Tuple[float, float, float],
+    scale: float,
+    yaw_deg: float,
+    pitch_deg: float,
+    zoom: float,
+    pan_x: float,
+    pan_y: float,
+) -> Tuple[Tuple[int, int], float]:
+    cx, cy, cz = center
+    x, y, z = point
+    x -= cx
+    y -= cy
+    z -= cz
+
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    x2, y2, z2 = _rotate_point((x, y, z), yaw, pitch)
+
+    cx_px = width * 0.5
+    cy_px = height * 0.5
+    px = cx_px + (x2 + z2 * 0.35) * (scale * zoom) + pan_x
+    py = cy_px + (-y2 - z2 * 0.20) * (scale * zoom) + pan_y
+    return (
+        (
+            max(0, min(width - 1, int(round(px)))),
+            max(0, min(height - 1, int(round(py)))),
+        ),
+        float(z2),
+    )
+
+
+def _segment_color(index: int) -> Tuple[int, int, int]:
+    palette = [
+        (0, 180, 255),
+        (180, 0, 255),
+        (255, 102, 0),
+        (64, 255, 64),
+        (255, 255, 0),
+        (0, 255, 255),
+        (255, 150, 150),
+    ]
+    return palette[index % len(palette)]
+
+
+def get_space3d_gizmo_layout(frame_w: int, frame_h: int) -> dict[str, float]:
+    if frame_w <= 0 or frame_h <= 0:
+        return {
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 0.0,
+            "y2": 0.0,
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "size": 0.0,
+            "axis_scale": 0.0,
+            "handle_radius": 0.0,
+            "label_offset": 0.0,
+        }
+
+    base_size = int(min(frame_w, frame_h, SPACE3D_GIZMO_SIZE))
+    usable = min(frame_w, frame_h) - (SPACE3D_GIZMO_MARGIN * 2)
+    if usable <= _SPACE3D_GIZMO_MIN_SIZE:
+        return {
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 0.0,
+            "y2": 0.0,
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "size": 0.0,
+            "axis_scale": 0.0,
+            "handle_radius": 0.0,
+            "label_offset": 0.0,
+        }
+
+    gizmo_size = float(max(_SPACE3D_GIZMO_MIN_SIZE, min(base_size, usable)))
+    x2 = float(max(0.0, float(frame_w - SPACE3D_GIZMO_MARGIN)))
+    x1 = float(max(0.0, x2 - gizmo_size))
+    y1 = float(SPACE3D_GIZMO_MARGIN)
+    y2 = float(min(frame_h - 1, y1 + gizmo_size))
+    center_x = (x1 + x2) * 0.5
+    center_y = (y1 + y2) * 0.5
+    axis_scale = gizmo_size * 0.36
+    return {
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "center_x": center_x,
+        "center_y": center_y,
+        "size": gizmo_size,
+        "axis_scale": axis_scale,
+        "handle_radius": max(8.0, gizmo_size * 0.09),
+        "label_offset": max(10.0, gizmo_size * 0.13),
+    }
+
+
+def project_space3d_gizmo_point(
+    point: Tuple[float, float, float],
+    layout: Mapping[str, float],
+    yaw_deg: float,
+    pitch_deg: float,
+) -> Tuple[int, int]:
+    axis_scale = float(layout.get("axis_scale", 1.0))
+    cx = float(layout.get("center_x", 0.0))
+    cy = float(layout.get("center_y", 0.0))
+
+    x2, y2, z2 = _rotate_point(point, math.radians(yaw_deg), math.radians(pitch_deg))
+    px = cx + (x2 + z2 * 0.45) * axis_scale * 0.5
+    py = cy + (-y2 - z2 * 0.20) * axis_scale * 0.5
+    return int(round(px)), int(round(py))
+
+
+def _draw_space3d_gizmo(scene: np.ndarray, layout: Mapping[str, float], yaw_deg: float, pitch_deg: float) -> None:
+    if not layout.get("size"):
+        return
+
+    size = float(layout["size"])
+    x1 = int(round(layout["x1"]))
+    y1 = int(round(layout["y1"]))
+    x2 = int(round(layout["x2"]))
+    y2 = int(round(layout["y2"]))
+    cx = float(layout["center_x"])
+    cy = float(layout["center_y"])
+    label_offset = float(layout["label_offset"])
+    handle_radius = float(layout["handle_radius"])
+    axis_scale = float(layout["axis_scale"])
+    pad = max(1, int(round(size * 0.06)))
+
+    overlay = scene.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (22, 22, 22), -1)
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (64, 64, 64), 1)
+    cv2.circle(overlay, (int(round(cx)), int(round(cy))), int(round(axis_scale * 0.08)), (120, 120, 120), 1)
+
+    axis_display = (
+        ((1.0, 0.0, 0.0), "X", (0, 80, 255)),
+        ((0.0, 1.0, 0.0), "Y", (80, 255, 80)),
+        ((0.0, 0.0, 1.0), "Z", (80, 120, 255)),
+    )
+
+    for idx, (axis_point, label, color) in enumerate(axis_display):
+        end = project_space3d_gizmo_point(axis_point, layout, yaw_deg, pitch_deg)
+        cv2.line(overlay, (int(round(cx)), int(round(cy))), end, color, 2 - idx // 2, cv2.LINE_AA)
+        cv2.circle(overlay, end, int(round(handle_radius)), (255, 255, 255), 1, cv2.LINE_AA)
+        lx = end[0] + (label_offset if end[0] >= cx else -label_offset)
+        ly = end[1] + (label_offset if end[1] >= cy else -label_offset)
+        cv2.putText(
+            overlay,
+            label,
+            (int(round(lx)), int(round(ly))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.addWeighted(overlay, 0.85, scene, 0.15, 0.0, scene)
+
+
+def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optional[Mapping[str, Any]] = None):
+    if overlay is None:
+        return frame
+
+    frame_h, frame_w = int(frame.shape[0]), int(frame.shape[1])
+    scene = np.full((frame_h, frame_w, 3), 18, dtype=np.uint8)
+
+    yaw = _coerce_render_state(render_state, "yaw", 0.0)
+    pitch = _coerce_render_state(render_state, "pitch", 0.0)
+    zoom = _coerce_render_state(render_state, "zoom", 1.0)
+    pan_x = _coerce_render_state(render_state, "pan_x", 0.0)
+    pan_y = _coerce_render_state(render_state, "pan_y", 0.0)
+    zoom = max(0.08, min(6.0, zoom))
+
+    world_points = _collect_world_points_for_3d(overlay)
+    if not any(point is not None for point in world_points):
+        return frame
+
+    ground_alignment = _estimate_ground_alignment(world_points)
+    aligned_world_points: list[Optional[Tuple[float, float, float, Optional[float]]]] = []
+    for p in world_points:
+        if p is None:
+            aligned_world_points.append(None)
+            continue
+        x, y, z, visibility = p
+        ax, ay, az = _apply_ground_alignment((x, y, z), ground_alignment)
+        aligned_world_points.append((ax, ay, az, visibility))
+
+    visible_points = [
+        (point[0], point[1], point[2])
+        for point in aligned_world_points
+        if point is not None and (point[3] is None or point[3] >= 0.2)
+    ]
+
+    # Add COG / COP / BOS for scene context
+    cog = overlay.get("cog")
+    if isinstance(cog, Mapping):
+        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
+        if cog_xy is not None:
+            ax, ay, az = _apply_ground_alignment((cog_xy[0], cog_xy[1], 0.0), ground_alignment)
+            visible_points.append((ax, ay, az))
+
+    cop = overlay.get("cop")
+    if isinstance(cop, Mapping):
+        cop_xy = _as_point(cop.get("cop"))
+        if cop_xy is not None:
+            ax, ay, az = _apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment, project_to_ground=True)
+            visible_points.append((ax, ay, az))
+
+    bos = overlay.get("bos")
+    if isinstance(bos, Mapping):
+        for raw_point in bos.get("polygon", []) or []:
+            point = _as_point(raw_point)
+            if point is None:
+                continue
+            ax, ay, az = _apply_ground_alignment((point[0], point[1], 0.0), ground_alignment, project_to_ground=True)
+            visible_points.append((ax, ay, az))
+
+    for segment in SEGMENT_TABLE:
+        center_point = _segment_center_point(aligned_world_points, segment)
+        if center_point is not None:
+            visible_points.append(center_point)
+
+    if not visible_points:
+        return frame
+
+    center, scale = _scene_transform(visible_points, frame_w, frame_h)
+
+    def project(point: Tuple[float, float, float]) -> Tuple[Tuple[int, int], float]:
+        return _project_scene_point(
+            point,
+            frame_w,
+            frame_h,
+            center,
+            scale,
+            yaw_deg=yaw,
+            pitch_deg=pitch,
+            zoom=zoom,
+            pan_x=pan_x,
+            pan_y=pan_y,
+        )
+
+    # Axis
+    axis_scale = max(1.0, min(frame_w, frame_h) / 6.0) / scale
+    axes = [
+        ((-axis_scale, 0.0, 0.0), (axis_scale, 0.0, 0.0), (255, 80, 80)),
+        ((0.0, -axis_scale, 0.0), (0.0, axis_scale, 0.0), (80, 255, 80)),
+        ((0.0, 0.0, -axis_scale), (0.0, 0.0, axis_scale), (80, 80, 255)),
+    ]
+    axis_labels = [
+        ((axis_scale, 0.0, 0.0), "X"),
+        ((0.0, axis_scale, 0.0), "Y"),
+        ((0.0, 0.0, axis_scale), "Z"),
+    ]
+    for axis_start, axis_end, color in axes:
+        p0, z0 = project(axis_start)
+        p1, z1 = project(axis_end)
+        cv2.line(scene, p0, p1, color, 1, cv2.LINE_AA)
+        cv2.putText(scene, str(abs(round(axis_scale))), (p1[0] + 2, p1[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+    for axis_end, label in axis_labels:
+        p, _ = project(axis_end)
+        cv2.putText(
+            scene,
+            label,
+            (p[0] + 4, p[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+
+    gizmo_layout = get_space3d_gizmo_layout(frame_w, frame_h)
+    _draw_space3d_gizmo(scene, gizmo_layout, yaw_deg=yaw, pitch_deg=pitch)
+
+    # Segments (far to near)
+    segments_draw: list[tuple[float, Tuple[int, int], Tuple[int, int], Tuple[int, int, int], int]] = []
+    for idx, segment in enumerate(SEGMENT_TABLE):
+        start = _average_points(aligned_world_points, segment.start)
+        end = _average_points(aligned_world_points, segment.end)
+        if start is None or end is None:
+            continue
+        p0, z0 = project(start)
+        p1, z1 = project(end)
+        segments_draw.append((0.5 * (z0 + z1), p0, p1, _segment_color(idx), 2 if segment.mass >= 6.0 else 1))
+
+    segments_draw.sort(key=lambda item: item[0])
+    for _, p0, p1, color, thickness in segments_draw:
+        cv2.line(scene, p0, p1, color, thickness, cv2.LINE_AA)
+
+    # Segment centroids
+    for segment in SEGMENT_TABLE:
+        center_point = _segment_center_point(aligned_world_points, segment)
+        if center_point is None:
+            continue
+        p, _ = project(center_point)
+        cv2.circle(scene, p, 4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Landmarks
+    for item in aligned_world_points:
+        if item is None:
+            continue
+        x, y, z, visibility = item
+        if visibility is not None and visibility < 0.2:
+            continue
+        p, depth = project((x, y, z))
+        radius = max(1, min(4, int(round(3.5 - 0.1 * max(0.0, depth)))))
+        cv2.circle(scene, p, radius, (230, 230, 230), -1, cv2.LINE_AA)
+
+    # COG
+    if isinstance(cog, Mapping):
+        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
+        if cog_xy is not None:
+            c, _ = project(_apply_ground_alignment((cog_xy[0], cog_xy[1], 0.0), ground_alignment))
+            cv2.circle(scene, c, 7, (0, 180, 255), -1, cv2.LINE_AA)
+            conf = _as_float(cog.get("confidence"))
+            if conf is not None:
+                cv2.putText(scene, f"COG {conf:.2f}", (c[0] + 8, max(0, c[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 180, 255), 1, cv2.LINE_AA)
+
+    # COP
+    if isinstance(cop, Mapping):
+        cop_xy = _as_point(cop.get("cop"))
+        if cop_xy is not None:
+            c, _ = project(_apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment))
+            cv2.circle(scene, c, 5, (255, 255, 0), -1, cv2.LINE_AA)
+
+    # BOS
+    if isinstance(bos, Mapping):
+        bos_points = []
+        for raw_point in bos.get("polygon", []) or []:
+            point = _as_point(raw_point)
+            if point is None:
+                continue
+            bos_points.append(project(_apply_ground_alignment((point[0], point[1], 0.0), ground_alignment))[0])
+
+        if len(bos_points) >= 3:
+            pts = np.array(bos_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(scene, [pts], isClosed=True, color=(120, 255, 120), thickness=2, lineType=cv2.LINE_AA)
+
+    cv2.putText(scene, "3D Mode", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (170, 170, 170), 1, cv2.LINE_AA)
+    cv2.putText(
+        scene,
+        "XYZ: X=right, Y=up, Z=front",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA,
+    )
+    return scene
+
+
+def draw_frame_overlay(
+    frame,
+    overlay,
+    render_mode: str = RENDER_MODE_OVERLAY,
+    render_state: Optional[Mapping[str, Any]] = None,
+):
+    if render_mode not in RENDER_MODE_OPTIONS:
+        render_mode = RENDER_MODE_OVERLAY
+    if render_mode == RENDER_MODE_SPACE3D:
+        return _draw_frame_space3d(frame, overlay, render_state=render_state)
+    return _draw_frame_overlay_2d(frame, overlay)
+
+
+def _draw_frame_overlay_2d(frame, overlay):
     if overlay is None:
         return frame
 
@@ -215,13 +941,13 @@ def draw_frame_overlay(frame, overlay):
         w, h = shape
     else:
         h, w = int(frame.shape[0]), int(frame.shape[1])
+
     world_points = []
     if isinstance(overlay, Mapping):
         world_points = overlay.get("pose", {}).get("world_landmarks", [])
     world_bounds = _world_bounds(world_points)
     world_transform = _fit_world_to_pixel_affine(landmarks, world_points, w, h)
 
-    # draw landmarks
     for idx, p in enumerate(landmarks):
         point = _pose_point(p)
         if point is None:
@@ -252,7 +978,6 @@ def draw_frame_overlay(frame, overlay):
         p2 = (int(xb * w), int(yb * h))
         cv2.line(frame, p1, p2, (0, 255, 255), 1)
 
-    # COG
     cog = overlay.get("cog")
     if isinstance(cog, Mapping):
         cog_xy = _as_point(cog.get("point") or cog.get("cog"))
@@ -275,7 +1000,6 @@ def draw_frame_overlay(frame, overlay):
                     1,
                 )
 
-    # BOS
     bos = overlay.get("bos")
     if isinstance(bos, Mapping):
         polygon = []
@@ -300,7 +1024,6 @@ def draw_frame_overlay(frame, overlay):
                     (255, 200, 0),
                     2,
                 )
-
         elif len(polygon) == 2:
             cv2.line(frame, polygon[0], polygon[1], (255, 200, 0), 2)
 
@@ -316,7 +1039,6 @@ def draw_frame_overlay(frame, overlay):
                 1,
             )
 
-    # COP
     cop = overlay.get("cop") or {}
     if isinstance(cop, Mapping):
         cp = _cop_point(cop.get("cop"))

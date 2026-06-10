@@ -63,7 +63,13 @@ cogsb analyze image --path sample.jpg --mode offline --output-dir outputs/image_
 ```bash
 cogsb visualize sample.mp4 outputs/video_run/frames.jsonl
 cogsb visualize sample.mp4 outputs/video_run/frames.jsonl --output rendered.mp4
+cogsb visualize sample.mp4 outputs/video_run/frames.jsonl --render-mode space3d --output rendered_3d.mp4
 ```
+
+`render-mode`:
+
+- `overlay`（既定）: 入力画像にCOG/BOS/COPなどを重ねて表示
+- `space3d`: 3D空間上にセグメント・重心・COP/BOSを配置して表示
 
 - ワンコマンドでライブ起動
 

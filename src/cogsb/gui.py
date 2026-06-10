@@ -17,10 +17,25 @@ from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
 from cogsb.sources import LiveCameraSource, RecordedImageSource, RecordedVideoSource
-from cogsb.visualization.draw import draw_frame_overlay
+from cogsb.visualization.draw import (
+    SPACE3D_GIZMO_HANDLE_RADIUS,
+    SPACE3D_GIZMO_SIZE,
+    RENDER_MODE_OPTIONS,
+    RENDER_MODE_OVERLAY,
+    RENDER_MODE_SPACE3D,
+    draw_frame_overlay,
+    get_space3d_gizmo_layout,
+    project_space3d_gizmo_point,
+)
 
 
 class COGSBGUI:
+    _AXIS_VIEWS = {
+        "x": {"yaw": 90.0, "pitch": 0.0},
+        "y": {"yaw": 0.0, "pitch": -90.0},
+        "z": {"yaw": 0.0, "pitch": 0.0},
+    }
+
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("COG / SB 可視化GUI")
@@ -30,6 +45,8 @@ class COGSBGUI:
 
         self.source_var = tk.StringVar(value="image")
         self.source_path_var = tk.StringVar()
+        self.render_mode_var = tk.StringVar(value=RENDER_MODE_OVERLAY)
+        self.render_mode_radios: list[ttk.Radiobutton] = []
         self.camera_var = tk.StringVar(value="0")
         self.status_var = tk.StringVar(value="起動準備完了")
         self.info_var = tk.StringVar(value="")
@@ -39,6 +56,26 @@ class COGSBGUI:
         self._stop_event = threading.Event()
         self._queue: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=12)
         self._last_output_path = Path("outputs")
+        self._latest_render_frame: Optional[Any] = None
+        self._latest_render_output = None
+        self._space3d_view = {
+            "yaw": -40.0,
+            "pitch": 22.0,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        }
+        self._space3d_drag = {
+            "mode": None,
+            "start_x": 0,
+            "start_y": 0,
+            "base_yaw": -40.0,
+            "base_pitch": 22.0,
+            "base_pan_x": 0.0,
+            "base_pan_y": 0.0,
+        }
+        self._space3d_gizmo_layout = get_space3d_gizmo_layout(SPACE3D_GIZMO_SIZE, SPACE3D_GIZMO_SIZE)
+        self._canvas_image_box = {"x": 0, "y": 0, "w": 0, "h": 0}
 
         self._build_ui()
         self._queue_poll()
@@ -99,6 +136,27 @@ class COGSBGUI:
         self.stop_btn = ttk.Button(button_row, text="停止", command=self._stop_analysis, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
 
+        render_mode_row = ttk.Frame(controls)
+        render_mode_row.pack(fill=tk.X, padx=8, pady=(4, 6))
+        ttk.Label(render_mode_row, text="描画モード").pack(side=tk.LEFT)
+        for value, caption in (
+            (RENDER_MODE_OVERLAY, "画像重ね"),
+            (RENDER_MODE_SPACE3D, "3D空間"),
+        ):
+            radio = ttk.Radiobutton(
+                render_mode_row,
+                text=caption,
+                value=value,
+                variable=self.render_mode_var,
+                command=self._on_render_mode_change,
+            )
+            radio.pack(side=tk.LEFT, padx=(8, 4))
+            self.render_mode_radios.append(radio)
+
+        reset_row = ttk.Frame(controls)
+        reset_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(reset_row, text="3D視点リセット", command=self._reset_space3d_view).pack(side=tk.LEFT)
+
         status_row = ttk.Frame(controls)
         status_row.pack(fill=tk.X, padx=8, pady=(4, 2))
         ttk.Label(status_row, text="状態:").pack(side=tk.LEFT)
@@ -129,13 +187,29 @@ class COGSBGUI:
         )
 
         preview = ttk.LabelFrame(
-            preview_area, text="解析結果プレビュー（重心・支持基底面・圧中心点を重畳表示）"
+            preview_area, text="解析結果プレビュー（2D重ね合わせ / 3D空間表示）"
         )
         preview.pack(fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(preview, bg="#111111", width=1024, height=576, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_rotate_start)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_drag_end)
+        self.canvas.bind("<ButtonPress-3>", self._on_canvas_pan_start)
+        self.canvas.bind("<B3-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-3>", self._on_canvas_drag_end)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-4>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-5>", self._on_canvas_wheel)
+        self.root.bind_all("<KeyPress-x>", lambda event: self._set_space3d_axis_view("x"))
+        self.root.bind_all("<KeyPress-X>", lambda event: self._set_space3d_axis_view("x"))
+        self.root.bind_all("<KeyPress-y>", lambda event: self._set_space3d_axis_view("y"))
+        self.root.bind_all("<KeyPress-Y>", lambda event: self._set_space3d_axis_view("y"))
+        self.root.bind_all("<KeyPress-z>", lambda event: self._set_space3d_axis_view("z"))
+        self.root.bind_all("<KeyPress-Z>", lambda event: self._set_space3d_axis_view("z"))
 
         self._toggle_controls()
+        self.root.focus_set()
 
     def _toggle_controls(self) -> None:
         source = self.source_var.get()
@@ -252,12 +326,19 @@ class COGSBGUI:
         max_h = max(1, view_h)
 
         h, w = frame_to_show.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
+        scale_limit = max_w / w if is_main else min(max_w / w, 1.0)
+        scale = min(max_w / w, max_h / h, scale_limit)
         if scale < 1.0:
             frame_to_show = cv2.resize(
                 frame_to_show,
                 (max(1, int(w * scale)), max(1, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
+            )
+        elif scale > 1.0:
+            frame_to_show = cv2.resize(
+                frame_to_show,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_CUBIC,
             )
 
         encode_ok, png_data = cv2.imencode(".png", frame_to_show)
@@ -276,6 +357,8 @@ class COGSBGUI:
         x = max(0, (view_w - target_w) // 2)
         y = max(0, (view_h - target_h) // 2)
         canvas.create_image(x, y, image=image, anchor=tk.NW)
+        if is_main:
+            self._canvas_image_box = {"x": x, "y": y, "w": target_w, "h": target_h}
 
     def _preview_selected_file(self, path: str, source_type: str) -> None:
         self._set_sidebar_message("プレビュー読み込み中…")
@@ -360,6 +443,18 @@ class COGSBGUI:
                 for lm in output.pose.world_landmarks
             ]
 
+        if output.reconstructed is not None and output.reconstructed.joints_smooth:
+            payload["pose"]["pose3d_joints"] = [
+                {
+                    "x": float(x),
+                    "y": float(y),
+                    "z": float(z),
+                    "visibility": 1.0,
+                }
+                for x, y, z in output.reconstructed.joints_smooth
+            ]
+            payload["pose"]["pose3d_residual"] = float(output.reconstructed.optimization_residual)
+
         return payload
 
     @staticmethod
@@ -403,9 +498,22 @@ class COGSBGUI:
             if frame is None:
                 raise ValueError("描画フレームを取得できませんでした。")
 
+            source_frame = frame.copy()
             frame_h, frame_w = frame.shape[:2]
             overlay = self._to_overlay(output, (frame_h, frame_w))
-            frame = draw_frame_overlay(frame, overlay)
+            render_mode = self.render_mode_var.get()
+            if render_mode not in RENDER_MODE_OPTIONS:
+                render_mode = RENDER_MODE_OVERLAY
+            render_state = self._space3d_view if render_mode == RENDER_MODE_SPACE3D else None
+            frame = draw_frame_overlay(
+                source_frame,
+                overlay,
+                render_mode=render_mode,
+                render_state=render_state,
+            )
+
+            self._latest_render_frame = source_frame
+            self._latest_render_output = output
 
             self.canvas.update_idletasks()
             view_w = self.canvas.winfo_width()
@@ -441,11 +549,198 @@ class COGSBGUI:
             self.status_var.set("描画エラー")
             self.root.after(0, lambda: messagebox.showerror("描画エラー", str(exc)))
 
+    def _on_render_mode_change(self) -> None:
+        self._redraw_latest_frame()
+
+    def _reset_space3d_view(self) -> None:
+        self._space3d_view = {
+            "yaw": -40.0,
+            "pitch": 22.0,
+            "zoom": 1.0,
+            "pan_x": 0.0,
+            "pan_y": 0.0,
+        }
+        self._redraw_latest_frame()
+
+    @staticmethod
+    def _normalize_angle_deg(value: float) -> float:
+        return ((value + 180.0) % 360.0) - 180.0
+
+    def _set_space3d_view(self, *, yaw: float, pitch: float) -> None:
+        self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+        self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+        self._redraw_latest_frame()
+
+    def _set_space3d_axis_view(self, axis: str) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+
+        view = self._AXIS_VIEWS.get(axis.lower())
+        if view is None:
+            return
+        self._set_space3d_view(yaw=view["yaw"], pitch=view["pitch"])
+
+    def _to_main_image_coords(self, event_x: int, event_y: int) -> Optional[Tuple[int, int]]:
+        box = self._canvas_image_box
+        if not box["w"] or not box["h"]:
+            return None
+        x = event_x - box["x"]
+        y = event_y - box["y"]
+        if x < 0 or y < 0 or x >= box["w"] or y >= box["h"]:
+            return None
+        return x, y
+
+    def _get_space3d_gizmo_layout(self, image_w: int, image_h: int) -> dict[str, float]:
+        self._space3d_gizmo_layout = get_space3d_gizmo_layout(image_w, image_h)
+        return self._space3d_gizmo_layout
+
+    def _get_space3d_gizmo_axis_hit(self, image_x: int, image_y: int, image_w: int, image_h: int) -> Optional[str]:
+        layout = self._get_space3d_gizmo_layout(image_w, image_h)
+        if not layout.get("size"):
+            return None
+
+        yaw = float(self._space3d_view["yaw"])
+        pitch = float(self._space3d_view["pitch"])
+        axis_points = {
+            "x": (1.0, 0.0, 0.0),
+            "y": (0.0, 1.0, 0.0),
+            "z": (0.0, 0.0, 1.0),
+        }
+        handle_radius = float(max(
+            SPACE3D_GIZMO_HANDLE_RADIUS,
+            layout["handle_radius"] / 1.5,
+        ))
+
+        for axis, axis_point in axis_points.items():
+            px, py = project_space3d_gizmo_point(axis_point, layout, yaw, pitch)
+            dx = image_x - px
+            dy = image_y - py
+            if dx * dx + dy * dy <= handle_radius * handle_radius:
+                return axis
+        return None
+
+    def _in_space3d_gizmo(self, image_x: int, image_y: int, image_w: int, image_h: int) -> bool:
+        layout = self._get_space3d_gizmo_layout(image_w, image_h)
+        if not layout.get("size"):
+            return False
+        return (
+            layout["x1"] <= image_x <= layout["x2"]
+            and layout["y1"] <= image_y <= layout["y2"]
+        )
+
+    def _redraw_latest_frame(self) -> None:
+        if self._latest_render_frame is None or self._latest_render_output is None:
+            return
+        self._render_frame(self._latest_render_frame, self._latest_render_output)
+
+    def _on_canvas_rotate_start(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
+        image_w = self._canvas_image_box["w"]
+        image_h = self._canvas_image_box["h"]
+
+        if self._in_space3d_gizmo(image_x, image_y, image_w, image_h):
+            axis = self._get_space3d_gizmo_axis_hit(image_x, image_y, image_w, image_h)
+            if axis is not None:
+                self._set_space3d_axis_view(axis)
+                self._space3d_drag["mode"] = "gizmo_click"
+                return
+            self._space3d_drag["mode"] = "gizmo"
+            self._space3d_drag["start_x"] = image_x
+            self._space3d_drag["start_y"] = image_y
+            self._space3d_drag["base_yaw"] = self._space3d_view["yaw"]
+            self._space3d_drag["base_pitch"] = self._space3d_view["pitch"]
+            return
+
+        self._space3d_drag["mode"] = "rotate"
+        self._space3d_drag["start_x"] = image_x
+        self._space3d_drag["start_y"] = image_y
+        self._space3d_drag["base_yaw"] = self._space3d_view["yaw"]
+        self._space3d_drag["base_pitch"] = self._space3d_view["pitch"]
+
+    def _on_canvas_pan_start(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
+        self._space3d_drag["mode"] = "pan"
+        self._space3d_drag["start_x"] = image_x
+        self._space3d_drag["start_y"] = image_y
+        self._space3d_drag["base_pan_x"] = self._space3d_view["pan_x"]
+        self._space3d_drag["base_pan_y"] = self._space3d_view["pan_y"]
+
+    def _on_canvas_drag(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+        mode = self._space3d_drag.get("mode")
+        if mode is None:
+            return
+
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
+        dx = float(image_x - self._space3d_drag["start_x"])
+        dy = float(image_y - self._space3d_drag["start_y"])
+
+        if mode == "rotate":
+            yaw = self._space3d_drag["base_yaw"] + dx * 0.35
+            pitch = self._space3d_drag["base_pitch"] + dy * 0.35
+            self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+            self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+            self._redraw_latest_frame()
+        elif mode == "gizmo":
+            yaw = self._space3d_drag["base_yaw"] + dx * 0.6
+            pitch = self._space3d_drag["base_pitch"] + dy * 0.6
+            self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+            self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+            self._redraw_latest_frame()
+        elif mode == "pan":
+            self._space3d_view["pan_x"] = self._space3d_drag["base_pan_x"] + dx
+            self._space3d_view["pan_y"] = self._space3d_drag["base_pan_y"] + dy
+            self._redraw_latest_frame()
+        elif mode == "gizmo_click":
+            return
+        else:
+            return
+
+    def _on_canvas_drag_end(self, event: tk.Event[tk.Misc]) -> None:
+        self._space3d_drag["mode"] = None
+
+    def _on_canvas_wheel(self, event: tk.Event[tk.Misc]) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+
+        delta = 0
+        if hasattr(event, "num") and event.num in (4, 5):
+            delta = 1 if event.num == 4 else -1
+        else:
+            if hasattr(event, "delta") and event.delta != 0:
+                delta = 1 if event.delta > 0 else -1
+
+        if delta == 0:
+            return
+
+        factor = 1.12 if delta > 0 else 0.89
+        zoom = self._space3d_view["zoom"] * factor
+        self._space3d_view["zoom"] = max(0.08, min(6.0, zoom))
+        self._redraw_latest_frame()
+
     def _set_controls(self, running: bool) -> None:
         state = tk.DISABLED if running else tk.NORMAL
         self.start_btn.config(state=state)
         self.browse_btn.config(state=tk.DISABLED if running or self.source_var.get() == "live" else tk.NORMAL)
         self.path_entry.config(state=tk.DISABLED if self.source_var.get() == "live" or running else tk.NORMAL)
+        radio_state = tk.DISABLED if running else tk.NORMAL
+        for radio in self.render_mode_radios:
+            radio.config(state=radio_state)
         if running:
             self.stop_btn.config(state=tk.NORMAL)
             self.camera_entry.config(state=tk.NORMAL if self.source_var.get() == "live" else tk.DISABLED)

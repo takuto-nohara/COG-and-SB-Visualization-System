@@ -26,6 +26,7 @@ class AnalysisEngine:
         self.prev_joints: Optional[list[tuple[float, float, float]]] = None
         self.prev_cog = None
         self.prev_cog_vel = None
+        self.prev_joint_velocity: Optional[list[tuple[float, float, float]]] = None
         self.prev_bos_polygon = []
         self.prev_cop = None
         self.stats_processed = 0
@@ -77,6 +78,8 @@ class AnalysisEngine:
 
                 if not pose_frame.landmarks:
                     self.stats_dropped += 1
+                    self.prev_joint_velocity = None
+                    self.prev_joints = None
                     out = FrameOutput(
                         session_id=session_id,
                         frame_idx=frame.frame_idx,
@@ -101,9 +104,16 @@ class AnalysisEngine:
                 if frame.frame_idx == 0:
                     self.reconstructor.initialize_segment_lengths(pose_frame)
 
+                dt = 1.0 / (source.metadata.fps or 30.0)
+                if prev_source_ts is not None:
+                    dt = max(frame.source_timestamp - prev_source_ts, 1e-6)
+                prev_source_ts = frame.source_timestamp
+
                 joints_recon, residual, scale = self.reconstructor.reconstruct(
                     pose_frame,
                     prev_joints=self.prev_joints,
+                    prev_velocity=self.prev_joint_velocity,
+                    dt=dt,
                     fallback_world_scale=1.0,
                 )
                 joints_smooth = self.smoother.update(joints_recon)
@@ -129,11 +139,6 @@ class AnalysisEngine:
                     confidence=float(conf),
                     frame_idx=frame.frame_idx,
                 )
-
-                dt = 1.0 / (source.metadata.fps or 30.0)
-                if prev_source_ts is not None:
-                    dt = max(frame.source_timestamp - prev_source_ts, 1e-6)
-                prev_source_ts = frame.source_timestamp
 
                 bos_dict = compute_bos(
                     world_landmarks=joints_smooth,
@@ -200,6 +205,22 @@ class AnalysisEngine:
                     cop=cop_state,
                     overlays=out_overlays,
                 )
+
+                if self.prev_joints is not None and len(self.prev_joints) == len(joints_recon):
+                    prev_arr = np.array(self.prev_joints, dtype=np.float64)
+                    cur_arr = np.array(joints_recon, dtype=np.float64)
+                    if prev_arr.shape == cur_arr.shape:
+                        vel = (cur_arr - prev_arr) / max(dt, 1e-6)
+                        if np.all(np.isfinite(vel)):
+                            self.prev_joint_velocity = [
+                                (float(v[0]), float(v[1]), float(v[2])) for v in vel
+                            ]
+                        else:
+                            self.prev_joint_velocity = None
+                    else:
+                        self.prev_joint_velocity = None
+                else:
+                    self.prev_joint_velocity = None
 
                 self.prev_joints = joints_recon
                 self.stats_processed += 1
