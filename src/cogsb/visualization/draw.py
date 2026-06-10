@@ -19,6 +19,10 @@ RENDER_MODE_OVERLAY = "overlay"
 RENDER_MODE_SPACE3D = "space3d"
 RENDER_MODE_OPTIONS = {RENDER_MODE_OVERLAY, RENDER_MODE_SPACE3D}
 _GROUND_FOOT_LANDMARKS = (27, 28, 29, 30, 31, 32)
+SPACE3D_GIZMO_SIZE = 126
+SPACE3D_GIZMO_MARGIN = 10
+SPACE3D_GIZMO_HANDLE_RADIUS = 11
+_SPACE3D_GIZMO_MIN_SIZE = 56
 _GROUND_UP_HINT_PAIRS = (
     (23, 24),  # hips
     (11, 12),  # shoulders
@@ -598,6 +602,122 @@ def _segment_color(index: int) -> Tuple[int, int, int]:
     return palette[index % len(palette)]
 
 
+def get_space3d_gizmo_layout(frame_w: int, frame_h: int) -> dict[str, float]:
+    if frame_w <= 0 or frame_h <= 0:
+        return {
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 0.0,
+            "y2": 0.0,
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "size": 0.0,
+            "axis_scale": 0.0,
+            "handle_radius": 0.0,
+            "label_offset": 0.0,
+        }
+
+    base_size = int(min(frame_w, frame_h, SPACE3D_GIZMO_SIZE))
+    usable = min(frame_w, frame_h) - (SPACE3D_GIZMO_MARGIN * 2)
+    if usable <= _SPACE3D_GIZMO_MIN_SIZE:
+        return {
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 0.0,
+            "y2": 0.0,
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "size": 0.0,
+            "axis_scale": 0.0,
+            "handle_radius": 0.0,
+            "label_offset": 0.0,
+        }
+
+    gizmo_size = float(max(_SPACE3D_GIZMO_MIN_SIZE, min(base_size, usable)))
+    x2 = float(max(0.0, float(frame_w - SPACE3D_GIZMO_MARGIN)))
+    x1 = float(max(0.0, x2 - gizmo_size))
+    y1 = float(SPACE3D_GIZMO_MARGIN)
+    y2 = float(min(frame_h - 1, y1 + gizmo_size))
+    center_x = (x1 + x2) * 0.5
+    center_y = (y1 + y2) * 0.5
+    axis_scale = gizmo_size * 0.36
+    return {
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "center_x": center_x,
+        "center_y": center_y,
+        "size": gizmo_size,
+        "axis_scale": axis_scale,
+        "handle_radius": max(8.0, gizmo_size * 0.09),
+        "label_offset": max(10.0, gizmo_size * 0.13),
+    }
+
+
+def project_space3d_gizmo_point(
+    point: Tuple[float, float, float],
+    layout: Mapping[str, float],
+    yaw_deg: float,
+    pitch_deg: float,
+) -> Tuple[int, int]:
+    axis_scale = float(layout.get("axis_scale", 1.0))
+    cx = float(layout.get("center_x", 0.0))
+    cy = float(layout.get("center_y", 0.0))
+
+    x2, y2, z2 = _rotate_point(point, math.radians(yaw_deg), math.radians(pitch_deg))
+    px = cx + (x2 + z2 * 0.45) * axis_scale * 0.5
+    py = cy + (-y2 - z2 * 0.20) * axis_scale * 0.5
+    return int(round(px)), int(round(py))
+
+
+def _draw_space3d_gizmo(scene: np.ndarray, layout: Mapping[str, float], yaw_deg: float, pitch_deg: float) -> None:
+    if not layout.get("size"):
+        return
+
+    size = float(layout["size"])
+    x1 = int(round(layout["x1"]))
+    y1 = int(round(layout["y1"]))
+    x2 = int(round(layout["x2"]))
+    y2 = int(round(layout["y2"]))
+    cx = float(layout["center_x"])
+    cy = float(layout["center_y"])
+    label_offset = float(layout["label_offset"])
+    handle_radius = float(layout["handle_radius"])
+    axis_scale = float(layout["axis_scale"])
+    pad = max(1, int(round(size * 0.06)))
+
+    overlay = scene.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (22, 22, 22), -1)
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (64, 64, 64), 1)
+    cv2.circle(overlay, (int(round(cx)), int(round(cy))), int(round(axis_scale * 0.08)), (120, 120, 120), 1)
+
+    axis_display = (
+        ((1.0, 0.0, 0.0), "X", (0, 80, 255)),
+        ((0.0, 1.0, 0.0), "Y", (80, 255, 80)),
+        ((0.0, 0.0, 1.0), "Z", (80, 120, 255)),
+    )
+
+    for idx, (axis_point, label, color) in enumerate(axis_display):
+        end = project_space3d_gizmo_point(axis_point, layout, yaw_deg, pitch_deg)
+        cv2.line(overlay, (int(round(cx)), int(round(cy))), end, color, 2 - idx // 2, cv2.LINE_AA)
+        cv2.circle(overlay, end, int(round(handle_radius)), (255, 255, 255), 1, cv2.LINE_AA)
+        lx = end[0] + (label_offset if end[0] >= cx else -label_offset)
+        ly = end[1] + (label_offset if end[1] >= cy else -label_offset)
+        cv2.putText(
+            overlay,
+            label,
+            (int(round(lx)), int(round(ly))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.addWeighted(overlay, 0.85, scene, 0.15, 0.0, scene)
+
+
 def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optional[Mapping[str, Any]] = None):
     if overlay is None:
         return frame
@@ -710,6 +830,9 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
             1,
             cv2.LINE_AA,
         )
+
+    gizmo_layout = get_space3d_gizmo_layout(frame_w, frame_h)
+    _draw_space3d_gizmo(scene, gizmo_layout, yaw_deg=yaw, pitch_deg=pitch)
 
     # Segments (far to near)
     segments_draw: list[tuple[float, Tuple[int, int], Tuple[int, int], Tuple[int, int, int], int]] = []

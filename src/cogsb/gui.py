@@ -17,10 +17,25 @@ from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
 from cogsb.sources import LiveCameraSource, RecordedImageSource, RecordedVideoSource
-from cogsb.visualization.draw import RENDER_MODE_OPTIONS, RENDER_MODE_OVERLAY, RENDER_MODE_SPACE3D, draw_frame_overlay
+from cogsb.visualization.draw import (
+    SPACE3D_GIZMO_HANDLE_RADIUS,
+    SPACE3D_GIZMO_SIZE,
+    RENDER_MODE_OPTIONS,
+    RENDER_MODE_OVERLAY,
+    RENDER_MODE_SPACE3D,
+    draw_frame_overlay,
+    get_space3d_gizmo_layout,
+    project_space3d_gizmo_point,
+)
 
 
 class COGSBGUI:
+    _AXIS_VIEWS = {
+        "x": {"yaw": 90.0, "pitch": 0.0},
+        "y": {"yaw": 0.0, "pitch": -90.0},
+        "z": {"yaw": 0.0, "pitch": 0.0},
+    }
+
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("COG / SB 可視化GUI")
@@ -59,6 +74,8 @@ class COGSBGUI:
             "base_pan_x": 0.0,
             "base_pan_y": 0.0,
         }
+        self._space3d_gizmo_layout = get_space3d_gizmo_layout(SPACE3D_GIZMO_SIZE, SPACE3D_GIZMO_SIZE)
+        self._canvas_image_box = {"x": 0, "y": 0, "w": 0, "h": 0}
 
         self._build_ui()
         self._queue_poll()
@@ -184,8 +201,15 @@ class COGSBGUI:
         self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
         self.canvas.bind("<Button-4>", self._on_canvas_wheel)
         self.canvas.bind("<Button-5>", self._on_canvas_wheel)
+        self.root.bind_all("<KeyPress-x>", lambda event: self._set_space3d_axis_view("x"))
+        self.root.bind_all("<KeyPress-X>", lambda event: self._set_space3d_axis_view("x"))
+        self.root.bind_all("<KeyPress-y>", lambda event: self._set_space3d_axis_view("y"))
+        self.root.bind_all("<KeyPress-Y>", lambda event: self._set_space3d_axis_view("y"))
+        self.root.bind_all("<KeyPress-z>", lambda event: self._set_space3d_axis_view("z"))
+        self.root.bind_all("<KeyPress-Z>", lambda event: self._set_space3d_axis_view("z"))
 
         self._toggle_controls()
+        self.root.focus_set()
 
     def _toggle_controls(self) -> None:
         source = self.source_var.get()
@@ -333,6 +357,8 @@ class COGSBGUI:
         x = max(0, (view_w - target_w) // 2)
         y = max(0, (view_h - target_h) // 2)
         canvas.create_image(x, y, image=image, anchor=tk.NW)
+        if is_main:
+            self._canvas_image_box = {"x": x, "y": y, "w": target_w, "h": target_h}
 
     def _preview_selected_file(self, path: str, source_type: str) -> None:
         self._set_sidebar_message("プレビュー読み込み中…")
@@ -536,6 +562,72 @@ class COGSBGUI:
         }
         self._redraw_latest_frame()
 
+    @staticmethod
+    def _normalize_angle_deg(value: float) -> float:
+        return ((value + 180.0) % 360.0) - 180.0
+
+    def _set_space3d_view(self, *, yaw: float, pitch: float) -> None:
+        self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+        self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+        self._redraw_latest_frame()
+
+    def _set_space3d_axis_view(self, axis: str) -> None:
+        if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
+            return
+
+        view = self._AXIS_VIEWS.get(axis.lower())
+        if view is None:
+            return
+        self._set_space3d_view(yaw=view["yaw"], pitch=view["pitch"])
+
+    def _to_main_image_coords(self, event_x: int, event_y: int) -> Optional[Tuple[int, int]]:
+        box = self._canvas_image_box
+        if not box["w"] or not box["h"]:
+            return None
+        x = event_x - box["x"]
+        y = event_y - box["y"]
+        if x < 0 or y < 0 or x >= box["w"] or y >= box["h"]:
+            return None
+        return x, y
+
+    def _get_space3d_gizmo_layout(self, image_w: int, image_h: int) -> dict[str, float]:
+        self._space3d_gizmo_layout = get_space3d_gizmo_layout(image_w, image_h)
+        return self._space3d_gizmo_layout
+
+    def _get_space3d_gizmo_axis_hit(self, image_x: int, image_y: int, image_w: int, image_h: int) -> Optional[str]:
+        layout = self._get_space3d_gizmo_layout(image_w, image_h)
+        if not layout.get("size"):
+            return None
+
+        yaw = float(self._space3d_view["yaw"])
+        pitch = float(self._space3d_view["pitch"])
+        axis_points = {
+            "x": (1.0, 0.0, 0.0),
+            "y": (0.0, 1.0, 0.0),
+            "z": (0.0, 0.0, 1.0),
+        }
+        handle_radius = float(max(
+            SPACE3D_GIZMO_HANDLE_RADIUS,
+            layout["handle_radius"] / 1.5,
+        ))
+
+        for axis, axis_point in axis_points.items():
+            px, py = project_space3d_gizmo_point(axis_point, layout, yaw, pitch)
+            dx = image_x - px
+            dy = image_y - py
+            if dx * dx + dy * dy <= handle_radius * handle_radius:
+                return axis
+        return None
+
+    def _in_space3d_gizmo(self, image_x: int, image_y: int, image_w: int, image_h: int) -> bool:
+        layout = self._get_space3d_gizmo_layout(image_w, image_h)
+        if not layout.get("size"):
+            return False
+        return (
+            layout["x1"] <= image_x <= layout["x2"]
+            and layout["y1"] <= image_y <= layout["y2"]
+        )
+
     def _redraw_latest_frame(self) -> None:
         if self._latest_render_frame is None or self._latest_render_output is None:
             return
@@ -544,18 +636,43 @@ class COGSBGUI:
     def _on_canvas_rotate_start(self, event: tk.Event[tk.Misc]) -> None:
         if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
             return
+
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
+        image_w = self._canvas_image_box["w"]
+        image_h = self._canvas_image_box["h"]
+
+        if self._in_space3d_gizmo(image_x, image_y, image_w, image_h):
+            axis = self._get_space3d_gizmo_axis_hit(image_x, image_y, image_w, image_h)
+            if axis is not None:
+                self._set_space3d_axis_view(axis)
+                self._space3d_drag["mode"] = "gizmo_click"
+                return
+            self._space3d_drag["mode"] = "gizmo"
+            self._space3d_drag["start_x"] = image_x
+            self._space3d_drag["start_y"] = image_y
+            self._space3d_drag["base_yaw"] = self._space3d_view["yaw"]
+            self._space3d_drag["base_pitch"] = self._space3d_view["pitch"]
+            return
+
         self._space3d_drag["mode"] = "rotate"
-        self._space3d_drag["start_x"] = event.x
-        self._space3d_drag["start_y"] = event.y
+        self._space3d_drag["start_x"] = image_x
+        self._space3d_drag["start_y"] = image_y
         self._space3d_drag["base_yaw"] = self._space3d_view["yaw"]
         self._space3d_drag["base_pitch"] = self._space3d_view["pitch"]
 
     def _on_canvas_pan_start(self, event: tk.Event[tk.Misc]) -> None:
         if self.render_mode_var.get() != RENDER_MODE_SPACE3D:
             return
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
         self._space3d_drag["mode"] = "pan"
-        self._space3d_drag["start_x"] = event.x
-        self._space3d_drag["start_y"] = event.y
+        self._space3d_drag["start_x"] = image_x
+        self._space3d_drag["start_y"] = image_y
         self._space3d_drag["base_pan_x"] = self._space3d_view["pan_x"]
         self._space3d_drag["base_pan_y"] = self._space3d_view["pan_y"]
 
@@ -566,20 +683,33 @@ class COGSBGUI:
         if mode is None:
             return
 
-        dx = float(event.x - self._space3d_drag["start_x"])
-        dy = float(event.y - self._space3d_drag["start_y"])
+        image_pos = self._to_main_image_coords(event.x, event.y)
+        if image_pos is None:
+            return
+        image_x, image_y = image_pos
+        dx = float(image_x - self._space3d_drag["start_x"])
+        dy = float(image_y - self._space3d_drag["start_y"])
 
         if mode == "rotate":
             yaw = self._space3d_drag["base_yaw"] + dx * 0.35
-            pitch = self._space3d_drag["base_pitch"] - dy * 0.35
-            pitch = max(-85.0, min(85.0, pitch))
-            self._space3d_view["yaw"] = yaw
-            self._space3d_view["pitch"] = pitch
+            pitch = self._space3d_drag["base_pitch"] + dy * 0.35
+            self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+            self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+            self._redraw_latest_frame()
+        elif mode == "gizmo":
+            yaw = self._space3d_drag["base_yaw"] + dx * 0.6
+            pitch = self._space3d_drag["base_pitch"] + dy * 0.6
+            self._space3d_view["yaw"] = self._normalize_angle_deg(yaw)
+            self._space3d_view["pitch"] = self._normalize_angle_deg(pitch)
+            self._redraw_latest_frame()
         elif mode == "pan":
             self._space3d_view["pan_x"] = self._space3d_drag["base_pan_x"] + dx
             self._space3d_view["pan_y"] = self._space3d_drag["base_pan_y"] + dy
-
-        self._redraw_latest_frame()
+            self._redraw_latest_frame()
+        elif mode == "gizmo_click":
+            return
+        else:
+            return
 
     def _on_canvas_drag_end(self, event: tk.Event[tk.Misc]) -> None:
         self._space3d_drag["mode"] = None
