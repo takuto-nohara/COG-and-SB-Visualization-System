@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 import cv2
 
@@ -18,7 +18,9 @@ def load_overlay_json(path: str) -> Dict[int, dict]:
             if not line.strip():
                 continue
             payload = json.loads(line)
-            idx = payload.get("frame_idx")
+            if not isinstance(payload, dict):
+                continue
+            idx = cast(Any, payload).get("frame_idx")
             if idx is None:
                 continue
             overlays[int(idx)] = payload
@@ -47,9 +49,8 @@ def render_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if fps <= 0:
             fps = 30.0
-        fourcc_func = getattr(cv2, "VideoWriter_fourcc", None)
-        if callable(fourcc_func):
-            fourcc = int(fourcc_func(*"mp4v"))
+        if hasattr(cv2, "VideoWriter_fourcc"):
+            fourcc = cast(int, cv2.VideoWriter_fourcc(*"mp4v"))
         else:
             fourcc = int(ord("m") | (ord("p") << 8) | (ord("4") << 16) | (ord("v") << 24))
         writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))

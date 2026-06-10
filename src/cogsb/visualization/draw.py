@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple, cast
 
 import cv2
 import numpy as np
@@ -34,11 +34,21 @@ _GROUND_SIDE_HINT_PAIRS = (
 )
 
 
-def _as_float(v: object) -> Optional[float]:
-    try:
+def _as_float(v: Any) -> Optional[float]:
+    if isinstance(v, bool):
         return float(v)
-    except Exception:
-        return None
+    if isinstance(v, int):
+        return float(v)
+    if isinstance(v, float):
+        return v
+    if isinstance(v, np.number):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
 
 
 def _as_shape(value: Any) -> Optional[Tuple[int, int]]:
@@ -335,7 +345,9 @@ def _segment_center_point(
     )
 
 
-def _normalized_vector(vec: np.ndarray) -> Optional[np.ndarray]:
+def _normalized_vector(vec: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if vec is None:
+        return None
     norm = float(np.linalg.norm(vec))
     if not np.isfinite(norm) or norm <= 0.0:
         return None
@@ -511,6 +523,53 @@ def _apply_ground_alignment(
     if project_to_ground:
         return float(mapped[0]), 0.0, float(mapped[2])
     return float(mapped[0]), float(mapped[1]), float(mapped[2])
+
+
+def _support_point_to_world(
+    point_xy: Tuple[float, float],
+    support_polygon_xy: list[Tuple[float, float]],
+    support_polygon_world: list[Tuple[float, float, float]],
+) -> Optional[Tuple[float, float, float]]:
+    if len(support_polygon_xy) < 3 or len(support_polygon_world) < 3:
+        return None
+    if len(support_polygon_xy) != len(support_polygon_world):
+        return None
+    if not support_polygon_xy or not support_polygon_world:
+        return None
+
+    local = np.asarray(support_polygon_xy, dtype=np.float64)
+    world = np.asarray(support_polygon_world, dtype=np.float64)
+    if (
+        local.ndim != 2
+        or world.ndim != 2
+        or local.shape[1] != 2
+        or world.shape[1] != 3
+        or local.shape[0] < 3
+    ):
+        return None
+    if not (np.isfinite(local).all() and np.isfinite(world).all()):
+        return None
+
+    a = np.column_stack([local[:, 0], local[:, 1], np.ones(local.shape[0], dtype=np.float64)])
+    try:
+        fx, _, _, _ = np.linalg.lstsq(a, world[:, 0], rcond=None)
+        fy, _, _, _ = np.linalg.lstsq(a, world[:, 1], rcond=None)
+        fz, _, _, _ = np.linalg.lstsq(a, world[:, 2], rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    if not (np.isfinite(fx).all() and np.isfinite(fy).all() and np.isfinite(fz).all()):
+        return None
+
+    ux, uy, ox = fx
+    vx, vy, oy = fy
+    wx, wy, oz = fz
+    sx, sy = point_xy
+    return (
+        float(ux * sx + uy * sy + ox),
+        float(vx * sx + vy * sy + oy),
+        float(wx * sx + wy * sy + oz),
+    )
 
 
 def _rotate_point(point: Tuple[float, float, float], yaw: float, pitch: float) -> Tuple[float, float, float]:
@@ -753,28 +812,64 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
     ]
 
     # Add COG / COP / BOS for scene context
+    bos = overlay.get("bos")
+    cop = overlay.get("cop")
     cog = overlay.get("cog")
-    if isinstance(cog, Mapping):
-        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
-        if cog_xy is not None:
-            ax, ay, az = _apply_ground_alignment((cog_xy[0], cog_xy[1], 0.0), ground_alignment)
+    support_polygon_xy: list[tuple[float, float]] = []
+    support_point_world: Optional[tuple[float, float, float]] = None
+    bos_polygon_world: list[tuple[float, float, float]] = []
+    cog_xy_for_bos: Optional[tuple[float, float]] = None
+    if isinstance(bos, Mapping):
+        raw_support_point = bos.get("support_point_world")
+        support_point_world = _as_point3(raw_support_point)
+        raw_polygons = bos.get("polygon")
+        if isinstance(raw_polygons, list):
+            for raw_point in raw_polygons:
+                point = _as_point(raw_point)
+                if point is not None:
+                    support_polygon_xy.append(point)
+        bos_world = bos.get("polygon_world")
+        if isinstance(bos_world, list) and bos_world:
+            for raw_point in bos_world:
+                point = _as_point3(raw_point)
+                if point is None:
+                    continue
+                bos_polygon_world.append(point)
+
+        if not bos_polygon_world:
+            for point in support_polygon_xy:
+                bos_polygon_world.append((point[0], point[1], 0.0))
+
+        for point in bos_polygon_world:
+            ax, ay, az = _apply_ground_alignment(point, ground_alignment, project_to_ground=True)
             visible_points.append((ax, ay, az))
 
-    cop = overlay.get("cop")
+    cop_world: Optional[tuple[float, float, float]] = None
     if isinstance(cop, Mapping):
         cop_xy = _as_point(cop.get("cop"))
         if cop_xy is not None:
-            ax, ay, az = _apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment, project_to_ground=True)
-            visible_points.append((ax, ay, az))
+            cop_world = _support_point_to_world(cop_xy, support_polygon_xy, bos_polygon_world)
+            if cop_world is None:
+                cop_world = (cop_xy[0], cop_xy[1], 0.0)
+            cop_aligned = _apply_ground_alignment(cop_world, ground_alignment, project_to_ground=True)
+            visible_points.append((cop_aligned[0], cop_aligned[1], cop_aligned[2]))
 
-    bos = overlay.get("bos")
-    if isinstance(bos, Mapping):
-        for raw_point in bos.get("polygon", []) or []:
-            point = _as_point(raw_point)
-            if point is None:
-                continue
-            ax, ay, az = _apply_ground_alignment((point[0], point[1], 0.0), ground_alignment, project_to_ground=True)
-            visible_points.append((ax, ay, az))
+    if isinstance(cog, Mapping):
+        cog_xy_for_bos = _as_point(cog.get("point") or cog.get("cog"))
+        aligned_cog: Optional[tuple[float, float, float]] = None
+        if support_point_world is not None:
+            if cog_xy_for_bos is not None:
+                dx = support_point_world[0] - cog_xy_for_bos[0]
+                dy = support_point_world[1] - cog_xy_for_bos[1]
+                if not np.isfinite(dx) or not np.isfinite(dy) or (dx * dx + dy * dy) > 0.05:
+                    support_point_world = None
+            if support_point_world is not None:
+                aligned_cog = _apply_ground_alignment(support_point_world, ground_alignment)
+        else:
+            if cog_xy_for_bos is not None:
+                aligned_cog = _apply_ground_alignment((cog_xy_for_bos[0], cog_xy_for_bos[1], 0.0), ground_alignment)
+        if aligned_cog is not None:
+            visible_points.append((aligned_cog[0], aligned_cog[1], aligned_cog[2]))
 
     for segment in SEGMENT_TABLE:
         center_point = _segment_center_point(aligned_world_points, segment)
@@ -870,29 +965,44 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
 
     # COG
     if isinstance(cog, Mapping):
-        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
-        if cog_xy is not None:
-            c, _ = project(_apply_ground_alignment((cog_xy[0], cog_xy[1], 0.0), ground_alignment))
+        aligned_cog: Optional[tuple[float, float, float]] = None
+        if support_point_world is not None:
+            if cog_xy_for_bos is not None:
+                dx = support_point_world[0] - cog_xy_for_bos[0]
+                dy = support_point_world[1] - cog_xy_for_bos[1]
+                if not np.isfinite(dx) or not np.isfinite(dy) or (dx * dx + dy * dy) > 0.05:
+                    support_point_world = None
+            if support_point_world is not None:
+                aligned_cog = _apply_ground_alignment(support_point_world, ground_alignment)
+        else:
+            if cog_xy_for_bos is not None:
+                aligned_cog = _apply_ground_alignment((cog_xy_for_bos[0], cog_xy_for_bos[1], 0.0), ground_alignment)
+
+        c = None
+        if aligned_cog is not None:
+            c, _ = project(aligned_cog)
+        if c is not None:
             cv2.circle(scene, c, 7, (0, 180, 255), -1, cv2.LINE_AA)
             conf = _as_float(cog.get("confidence"))
             if conf is not None:
                 cv2.putText(scene, f"COG {conf:.2f}", (c[0] + 8, max(0, c[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 180, 255), 1, cv2.LINE_AA)
 
     # COP
-    if isinstance(cop, Mapping):
-        cop_xy = _as_point(cop.get("cop"))
-        if cop_xy is not None:
-            c, _ = project(_apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment))
-            cv2.circle(scene, c, 5, (255, 255, 0), -1, cv2.LINE_AA)
+        if isinstance(cop, Mapping):
+            if cop_world is None:
+                cop_xy = _as_point(cop.get("cop"))
+                if cop_xy is not None:
+                    cop_world = (cop_xy[0], cop_xy[1], 0.0)
+            if cop_world is not None:
+                cop_point, _ = project(_apply_ground_alignment(cop_world, ground_alignment))
+                c = cop_point
+                cv2.circle(scene, c, 5, (255, 255, 0), -1, cv2.LINE_AA)
 
     # BOS
-    if isinstance(bos, Mapping):
+    if isinstance(bos, Mapping) and bos_polygon_world:
         bos_points = []
-        for raw_point in bos.get("polygon", []) or []:
-            point = _as_point(raw_point)
-            if point is None:
-                continue
-            bos_points.append(project(_apply_ground_alignment((point[0], point[1], 0.0), ground_alignment))[0])
+        for point in bos_polygon_world:
+            bos_points.append(project(_apply_ground_alignment(point, ground_alignment, project_to_ground=True))[0])
 
         if len(bos_points) >= 3:
             pts = np.array(bos_points, dtype=np.int32).reshape((-1, 1, 2))
@@ -929,9 +1039,10 @@ def _draw_frame_overlay_2d(frame, overlay):
     if overlay is None:
         return frame
 
-    pose = overlay.get("pose") or {}
+    pose = overlay.get("pose") if isinstance(overlay.get("pose"), Mapping) else {}
     if isinstance(pose, Mapping):
-        landmarks = pose.get("landmarks") if isinstance(pose.get("landmarks"), list) else []
+        raw_landmarks = pose.get("landmarks")
+        landmarks = raw_landmarks if isinstance(raw_landmarks, list) else []
         shape = _as_shape(pose.get("shape"))
     else:
         landmarks = []
@@ -942,9 +1053,13 @@ def _draw_frame_overlay_2d(frame, overlay):
     else:
         h, w = int(frame.shape[0]), int(frame.shape[1])
 
-    world_points = []
+    world_points: list[Any] = []
     if isinstance(overlay, Mapping):
-        world_points = overlay.get("pose", {}).get("world_landmarks", [])
+        pose_payload = overlay.get("pose")
+        if isinstance(pose_payload, Mapping):
+            raw_world_points = pose_payload.get("world_landmarks")
+            if isinstance(raw_world_points, list):
+                world_points = raw_world_points
     world_bounds = _world_bounds(world_points)
     world_transform = _fit_world_to_pixel_affine(landmarks, world_points, w, h)
 
@@ -979,35 +1094,28 @@ def _draw_frame_overlay_2d(frame, overlay):
         cv2.line(frame, p1, p2, (0, 255, 255), 1)
 
     cog = overlay.get("cog")
-    if isinstance(cog, Mapping):
-        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
-    else:
-        cog_xy = _as_point(cog)
-    if cog_xy is not None:
-        cx, cy = _world_to_pixel_mapped(cog_xy, w, h, world_transform, world_bounds)
-        if 0 <= cx < w and 0 <= cy < h:
-            cv2.circle(frame, (cx, cy), 6, (0, 200, 255), -1)
-            cv2.circle(frame, (cx, cy), 7, (255, 255, 255), 1)
-            conf = _as_float(cog.get("confidence")) if isinstance(cog, Mapping) else None
-            if conf is not None:
-                cv2.putText(
-                    frame,
-                    f"COG conf={conf:.2f}",
-                    (cx + 8, max(0, cy - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (0, 200, 255),
-                    1,
-                )
-
     bos = overlay.get("bos")
+    support_point_world: Optional[tuple[float, float, float]] = None
     if isinstance(bos, Mapping):
-        polygon = []
-        for raw_point in bos.get("polygon", []) or []:
-            p = _as_point(raw_point)
-            if p is None:
-                continue
-            polygon.append(_world_to_pixel_mapped(p, w, h, world_transform, world_bounds))
+        support_point_world = _as_point3(bos.get("support_point_world"))
+
+    if isinstance(bos, Mapping):
+        polygon: list[tuple[int, int]] = []
+        polygon_world = bos.get("polygon_world")
+        if isinstance(polygon_world, list) and polygon_world:
+            for raw_point in polygon_world:
+                point = _as_point3(raw_point)
+                if point is None:
+                    continue
+                polygon.append(_world_to_pixel_mapped((point[0], point[1]), w, h, world_transform, world_bounds))
+        if not polygon:
+            raw_polygon = bos.get("polygon")
+            if isinstance(raw_polygon, list):
+                for raw_point in raw_polygon:
+                    p = _as_point(raw_point)
+                    if p is None:
+                        continue
+                    polygon.append(_world_to_pixel_mapped(p, w, h, world_transform, world_bounds))
 
         if len(polygon) >= 3:
             pts = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
@@ -1039,12 +1147,43 @@ def _draw_frame_overlay_2d(frame, overlay):
                 1,
             )
 
+    if isinstance(cog, Mapping):
+        cog_xy = _as_point(cog.get("point") or cog.get("cog"))
+        if support_point_world is not None:
+            support_point: Optional[tuple[float, float, float]] = support_point_world
+            if cog_xy is not None:
+                dx = support_point_world[0] - cog_xy[0]
+                dy = support_point_world[1] - cog_xy[1]
+                if not np.isfinite(dx) or not np.isfinite(dy) or (dx * dx + dy * dy) > 0.05:
+                    support_point = None
+            if support_point is not None:
+                cx, cy = _world_to_pixel_mapped((support_point[0], support_point[1]), w, h, world_transform, world_bounds)
+            else:
+                cx = cy = None
+        elif cog_xy is not None:
+            cx, cy = _world_to_pixel_mapped((cog_xy[0], cog_xy[1]), w, h, world_transform, world_bounds)
+        else:
+            cx = cy = None
+        if cx is not None and cy is not None and 0 <= cx < w and 0 <= cy < h:
+            cv2.circle(frame, (cx, cy), 6, (0, 200, 255), -1)
+            cv2.circle(frame, (cx, cy), 7, (255, 255, 255), 1)
+            conf = _as_float(cog.get("confidence")) if isinstance(cog, Mapping) else None
+            if conf is not None:
+                cv2.putText(
+                    frame,
+                    f"COG conf={conf:.2f}",
+                    (cx + 8, max(0, cy - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 200, 255),
+                    1,
+                )
+
     cop = overlay.get("cop") or {}
     if isinstance(cop, Mapping):
         cp = _cop_point(cop.get("cop"))
         if cp is not None:
-            cp0, cp1 = cp
-            cx, cy = _world_to_pixel_mapped((cp0, cp1), w, h, world_transform, world_bounds)
+            cx, cy = _world_to_pixel_mapped((cp[0], cp[1]), w, h, world_transform, world_bounds)
             cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
 
     return frame

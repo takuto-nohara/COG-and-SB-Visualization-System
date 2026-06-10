@@ -7,12 +7,15 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from time import monotonic
 
 import cv2
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import traceback
 
 from cogsb.core import PipelineConfig, PipelineMode, SourceType
+from cogsb.core.types import FrameOutput
 from cogsb.pipeline.engine import AnalysisEngine
 from cogsb.pose import MediaPipePoseEstimator
 from cogsb.smpl.smpl_fitter import SMPLFitter
@@ -30,6 +33,8 @@ from cogsb.visualization.draw import (
 
 
 class COGSBGUI:
+    GUIQueueItem = tuple[str, ...]
+
     _AXIS_VIEWS = {
         "x": {"yaw": 90.0, "pitch": 0.0},
         "y": {"yaw": 0.0, "pitch": -90.0},
@@ -54,10 +59,14 @@ class COGSBGUI:
         self._preview_photo_image: Optional[tk.PhotoImage] = None
         self._worker: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._queue: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=12)
+        self._queue: queue.Queue[COGSBGUI.GUIQueueItem] = queue.Queue(maxsize=12)
         self._last_output_path = Path("outputs")
         self._latest_render_frame: Optional[Any] = None
-        self._latest_render_output = None
+        self._latest_render_output: Optional[FrameOutput] = None
+        self._last_render_error_message: Optional[str] = None
+        self._last_render_error_time = 0.0
+        self._last_analysis_error_message: Optional[str] = None
+        self._last_analysis_error_time = 0.0
         self._space3d_view = {
             "yaw": -40.0,
             "pitch": 22.0,
@@ -463,8 +472,10 @@ class COGSBGUI:
             return None
         return float(value[0]), float(value[1])
 
-    def _to_overlay(self, output, frame_shape: Tuple[int, int]) -> dict[str, Any]:
+    def _to_overlay(self, output: FrameOutput, frame_shape: Tuple[int, int]) -> dict[str, Any]:
         payload = self._to_pose_payload(output, frame_shape)
+        bos_support_point_world: Optional[tuple[float, float, float]] = None
+        bos = output.bos
 
         if output.cog is not None:
             cog_xy = self._to_float_pair(output.cog.cog[:2])
@@ -474,12 +485,39 @@ class COGSBGUI:
                     "confidence": float(output.cog.confidence),
                 }
 
-        if output.bos is not None:
+        if bos is not None:
+            if bos.support_point_world is not None:
+                bos_support_point_world = (
+                    float(bos.support_point_world[0]),
+                    float(bos.support_point_world[1]),
+                    float(bos.support_point_world[2]),
+                )
+            bos_polygon: list[tuple[float, float]] = []
+            if bos.polygon:
+                bos_polygon = [
+                    (float(x), float(y))
+                    for x, y in bos.polygon
+                ]
+            bos_polygon_world: list[tuple[float, float, float]] = []
+            if bos.polygon_world:
+                bos_polygon_world = [
+                    (float(x), float(y), float(z))
+                    for x, y, z in bos.polygon_world
+                ]
             payload["bos"] = {
-                "polygon": [[float(x), float(y)] for x, y in output.bos.polygon],
-                "inside": output.bos.inside_cog,
-                "inside_cog": output.bos.inside_cog,
-                "support_area": float(output.bos.support_area),
+                "polygon": [[float(x), float(y)] for x, y in bos_polygon],
+                "polygon_world": [
+                    [float(x), float(y), float(z)]
+                    for x, y, z in bos_polygon_world
+                ],
+                "support_point_world": (
+                    [float(v) for v in bos_support_point_world]
+                    if bos.support_point_world is not None
+                    else None
+                ),
+                "inside": bos.inside_cog,
+                "inside_cog": bos.inside_cog,
+                "support_area": float(bos.support_area),
             }
 
         if output.cop is not None and output.cop.cop is not None:
@@ -492,7 +530,15 @@ class COGSBGUI:
 
         return payload
 
-    def _render_frame(self, frame, output) -> None:
+    def _render_frame(self, frame: Any, output: FrameOutput) -> None:
+        render_mode = self.render_mode_var.get()
+        if render_mode not in RENDER_MODE_OPTIONS:
+            render_mode = RENDER_MODE_OVERLAY
+
+        frame_to_draw: Optional[Any] = None
+        source_frame: Optional[Any] = None
+        overlay: Optional[dict[str, Any]] = None
+
         try:
             frame = self._extract_frame_array(frame)
             if frame is None:
@@ -501,53 +547,76 @@ class COGSBGUI:
             source_frame = frame.copy()
             frame_h, frame_w = frame.shape[:2]
             overlay = self._to_overlay(output, (frame_h, frame_w))
-            render_mode = self.render_mode_var.get()
-            if render_mode not in RENDER_MODE_OPTIONS:
-                render_mode = RENDER_MODE_OVERLAY
             render_state = self._space3d_view if render_mode == RENDER_MODE_SPACE3D else None
-            frame = draw_frame_overlay(
+            frame_to_draw = draw_frame_overlay(
                 source_frame,
                 overlay,
                 render_mode=render_mode,
                 render_state=render_state,
             )
-
-            self._latest_render_frame = source_frame
-            self._latest_render_output = output
-
-            self.canvas.update_idletasks()
-            view_w = self.canvas.winfo_width()
-            view_h = self.canvas.winfo_height()
-            if view_w <= 1 or view_h <= 1:
-                self.root.after(25, lambda: self._render_frame(frame.copy(), output))
-                return
-
-            lines = [
-                f"frame: {output.frame_idx if output is not None else '-'}",
-                f"source: {output.source_type.value if output and output.source_type is not None else '-'}",
-            ]
-
-            if output.cog is not None:
-                cog_x, cog_y, cog_z = output.cog.cog
-                lines.append(f"COG: ({cog_x:.3f}, {cog_y:.3f}, {cog_z:.3f})")
-                if output.cog.confidence is not None:
-                    lines.append(f"COG conf: {output.cog.confidence:.2f}")
-
-            if output.bos is not None:
-                if output.bos.support_area is not None:
-                    lines.append(f"BOS area: {output.bos.support_area:.4f}")
-                if output.bos.inside_cog is not None:
-                    lines.append(f"COG in BOS: {output.bos.inside_cog}")
-
-            if output.cop is not None and output.cop.cop is not None:
-                lines.append(f"COP: ({output.cop.cop[0]:.3f}, {output.cop.cop[1]:.3f})")
-
-            self.info_var.set(" | ".join(lines))
-            self._draw_on_canvas(self.canvas, frame, max_w=view_w - 4, max_h=view_h - 4, is_main=True)
+        except NameError as exc:
+            if render_mode == RENDER_MODE_SPACE3D and source_frame is not None and overlay is not None:
+                self._log(f"描画エラー(3Dフォールバック): {exc}; {traceback.format_exc()}")
+                self._log("3D描画に失敗したため2D描画で続行します。")
+                frame_to_draw = draw_frame_overlay(
+                    source_frame,
+                    overlay,
+                    render_mode=RENDER_MODE_OVERLAY,
+                )
+            else:
+                raise
         except Exception as exc:
-            self._log(f"描画エラー: {exc}")
-            self.status_var.set("描画エラー")
-            self.root.after(0, lambda: messagebox.showerror("描画エラー", str(exc)))
+            error_message = str(exc)
+            if isinstance(exc, NameError):
+                self._log(f"描画エラー( NameError詳細 ): {error_message}; {traceback.format_exc()}")
+            now = monotonic()
+            if (
+                error_message != self._last_render_error_message
+                or now - self._last_render_error_time >= 3.0
+            ):
+                self._log(f"描画エラー: {error_message}")
+                self.status_var.set("描画エラー")
+                self._last_render_error_message = error_message
+                self._last_render_error_time = now
+                self.root.after(0, lambda: messagebox.showerror("描画エラー", error_message))
+            return
+
+        if frame_to_draw is None or source_frame is None:
+            self._log("描画エラー: 描画結果フレームを生成できませんでした。")
+            return
+
+        self._latest_render_frame = source_frame
+        self._latest_render_output = output
+
+        self.canvas.update_idletasks()
+        view_w = self.canvas.winfo_width()
+        view_h = self.canvas.winfo_height()
+        if view_w <= 1 or view_h <= 1:
+            self.root.after(25, lambda: self._render_frame(frame_to_draw.copy(), output))
+            return
+
+        lines = [
+            f"frame: {output.frame_idx}",
+            f"source: {output.source_type.value}",
+        ]
+
+        if output.cog is not None:
+            cog_x, cog_y, cog_z = output.cog.cog
+            lines.append(f"COG: ({cog_x:.3f}, {cog_y:.3f}, {cog_z:.3f})")
+            if output.cog.confidence is not None:
+                lines.append(f"COG conf: {output.cog.confidence:.2f}")
+
+        if output.bos is not None:
+            if output.bos.support_area is not None:
+                lines.append(f"BOS area: {output.bos.support_area:.4f}")
+            if output.bos.inside_cog is not None:
+                lines.append(f"COG in BOS: {output.bos.inside_cog}")
+
+        if output.cop is not None and output.cop.cop is not None:
+            lines.append(f"COP: ({output.cop.cop[0]:.3f}, {output.cop.cop[1]:.3f})")
+
+        self.info_var.set(" | ".join(lines))
+        self._draw_on_canvas(self.canvas, frame_to_draw, max_w=view_w - 4, max_h=view_h - 4, is_main=True)
 
     def _on_render_mode_change(self) -> None:
         self._redraw_latest_frame()
@@ -819,14 +888,15 @@ class COGSBGUI:
                         self._log("解析結果フレームの取得に失敗しました")
                         return True
                     try:
-                        self._queue.put(("frame", frame_array.copy(), frame_output), block=False)
+                        queue_item = ("frame", frame_array.copy(), frame_output)
+                        self._queue.put(queue_item, block=False)
                     except queue.Full:
                         try:
                             self._queue.get_nowait()
                         except Exception:
                             pass
                         try:
-                            self._queue.put(("frame", frame_array.copy(), frame_output), block=False)
+                            self._queue.put(queue_item, block=False)
                         except Exception:
                             return False
                     return True
@@ -872,16 +942,29 @@ class COGSBGUI:
         try:
             while True:
                 item = self._queue.get_nowait()
+                if not isinstance(item, tuple) or not item:
+                    continue
+
                 kind = item[0]
-                if kind == "frame":
-                    _, frame, output = item
-                    self._render_frame(frame, output)
-                elif kind == "status":
+                if kind == "frame" and len(item) == 3:
+                    frame = item[1]
+                    output = item[2]
+                    if isinstance(output, FrameOutput):
+                        self._render_frame(frame, output)
+                elif kind == "status" and len(item) == 2:
                     self.status_var.set(str(item[1]))
-                elif kind == "error":
-                    self.status_var.set(f"エラー: {item[1]}")
-                    messagebox.showerror("解析エラー", str(item[1]))
-                elif kind == "finished":
+                elif kind == "error" and len(item) == 2:
+                    error_message = str(item[1])
+                    now = monotonic()
+                    if (
+                        error_message != self._last_analysis_error_message
+                        or now - self._last_analysis_error_time >= 3.0
+                    ):
+                        self._last_analysis_error_message = error_message
+                        self._last_analysis_error_time = now
+                        self.status_var.set(f"エラー: {error_message}")
+                        messagebox.showerror("解析エラー", error_message)
+                elif kind == "finished" and len(item) == 1:
                     self._set_controls(False)
                     self._worker = None
         except queue.Empty:

@@ -105,6 +105,8 @@ class COGState:
 @dataclass
 class BOSState:
     polygon: List[Tuple[float, float]]
+    polygon_world: Optional[List[Tuple[float, float, float]]]
+    support_point_world: Optional[Tuple[float, float, float]]
     left_contact: float
     right_contact: float
     support_area: float

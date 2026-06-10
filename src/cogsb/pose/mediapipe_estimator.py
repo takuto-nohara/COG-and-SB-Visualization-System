@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import urllib.request
-from typing import List, Optional
+from typing import Any, List, Optional, cast
 
 import cv2
 try:
@@ -29,8 +29,12 @@ class MediaPipePoseEstimator:
         if mp is None:
             raise RuntimeError("mediapipe がインストールされていません。pip install mediapipe を実行してください。")
 
-        if hasattr(mp, "solutions"):
-            self.pose = mp.solutions.pose.Pose(
+        solutions_lib = getattr(mp, "solutions", None)
+        pose_module = getattr(solutions_lib, "pose", None) if solutions_lib is not None else None
+        pose_factory = getattr(pose_module, "Pose", None) if pose_module is not None else None
+        drawing_utils = getattr(solutions_lib, "drawing_utils", None) if solutions_lib is not None else None
+        if callable(pose_factory):
+            self.pose = pose_factory(
                 static_image_mode=static_image_mode,
                 model_complexity=model_complexity,
                 enable_segmentation=False,
@@ -38,7 +42,7 @@ class MediaPipePoseEstimator:
                 min_tracking_confidence=min_tracking_confidence,
                 smooth_landmarks=smooth_landmarks,
             )
-            self.draw = mp.solutions.drawing_utils  # type: ignore[assignment]
+            self.draw = drawing_utils
             self._task_mode = False
         else:
             try:

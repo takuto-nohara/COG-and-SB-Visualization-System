@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, cast
 import threading
 import time
 
@@ -9,10 +9,11 @@ import numpy as np
 from cogsb.core import COGState, PipelineConfig, PipelineMode, PoseFrame, ReconstructedFrame
 from cogsb.core.types import BOSState, FrameOutput
 from cogsb.core.util import new_session_id
-from cogsb.kinematics import COPEstimator, COPInput, COGEstimator, compute_bos, inside_bos
+from cogsb.kinematics import COPEstimator, COPInput, COGEstimator, compute_bos
 from cogsb.pipeline.writer import FrameWriter
 from cogsb.reconstruction import Smoother, SkeletonReconstructor
 from cogsb.smpl.smpl_fitter import SMPLFitter
+from cogsb.kinematics.bos import SupportFrame
 
 
 class AnalysisEngine:
@@ -24,18 +25,19 @@ class AnalysisEngine:
         self.cop_estimator = COPEstimator(default_mass_kg=70.0)
         self.smpl_fitter = smpl_fitter
         self.prev_joints: Optional[list[tuple[float, float, float]]] = None
-        self.prev_cog = None
-        self.prev_cog_vel = None
+        self.prev_cog: Optional[np.ndarray] = None
+        self.prev_cog_vel: Optional[np.ndarray] = None
         self.prev_joint_velocity: Optional[list[tuple[float, float, float]]] = None
-        self.prev_bos_polygon = []
-        self.prev_cop = None
+        self.prev_bos_polygon: list[tuple[float, float]] = []
+        self.prev_cop: Optional[tuple[float, float]] = None
+        self._prev_support_frame: Optional[SupportFrame] = None
         self.stats_processed = 0
         self.stats_dropped = 0
         self.latency_ms = 0.0
-        self._prev_ts = None
+        self._prev_ts: Optional[float] = None
 
     @staticmethod
-    def _to_points(pose_frame: PoseFrame):
+    def _to_points(pose_frame: PoseFrame) -> list[tuple[float, float, float]]:
         if pose_frame.world_landmarks:
             return [(p.x, p.y, p.z) for p in pose_frame.world_landmarks]
         return [(float(p.x), float(p.y), float(p.z)) for p in pose_frame.landmarks]
@@ -49,11 +51,13 @@ class AnalysisEngine:
             return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
         v = (cog - self.prev_cog) / dt
+        velocity = (float(v[0]), float(v[1]), float(v[2]))
         if self.prev_cog_vel is None:
-            return tuple(float(x) for x in v), (0.0, 0.0, 0.0)
+            return velocity, (0.0, 0.0, 0.0)
 
         a = (v - self.prev_cog_vel) / dt
-        return tuple(float(x) for x in v), tuple(float(x) for x in a)
+        acceleration = (float(a[0]), float(a[1]), float(a[2]))
+        return velocity, acceleration
 
     def run(
         self,
@@ -67,7 +71,7 @@ class AnalysisEngine:
         session_id = new_session_id("session")
         writer = FrameWriter(self.config.output_dir)
         outputs: List[FrameOutput] = []
-        prev_source_ts = None
+        prev_source_ts: Optional[float] = None
 
         try:
             for frame in source.iter_frames(max_frames=max_frames):
@@ -119,8 +123,12 @@ class AnalysisEngine:
                 joints_smooth = self.smoother.update(joints_recon)
 
                 cog_vec = self.cog_estimator.compute(joints_smooth)
-                cog_vec = (float(cog_vec[0]), float(cog_vec[1]), float(cog_vec[2]))
-                cog_np = np.array(cog_vec, dtype=np.float64)
+                cog_vec_3d = (
+                    float(cog_vec[0]),
+                    float(cog_vec[1]),
+                    float(cog_vec[2]),
+                )
+                cog_np = np.array(cog_vec_3d, dtype=np.float64)
                 v, a = self._estimate_pose_derivative(cog_np, frame.source_timestamp)
                 self._prev_ts = frame.source_timestamp
 
@@ -133,35 +141,51 @@ class AnalysisEngine:
                     conf = 0.0
 
                 cog_state = COGState(
-                    cog=tuple(float(x) for x in cog_vec),
+                    cog=cog_vec_3d,
                     velocity=v,
                     acceleration=a,
                     confidence=float(conf),
                     frame_idx=frame.frame_idx,
                 )
 
-                bos_dict = compute_bos(
+                bos_result, support_frame = compute_bos(
                     world_landmarks=joints_smooth,
                     prev_landmarks=self.prev_joints,
                     prev_polygon=self.prev_bos_polygon,
                     dt=dt,
+                    cog_point=cog_vec_3d,
+                    prev_support_frame=self._prev_support_frame,
+                    return_support_frame=True,
                 )
+                if support_frame is not None:
+                    self._prev_support_frame = support_frame
 
-                polygon = bos_dict["polygon"]
-                inside, margin = inside_bos((float(cog_vec[0]), float(cog_vec[1])), polygon)
+                polygon = bos_result["polygon"]
+                if len(polygon) < 3 and self.prev_bos_polygon:
+                    polygon = self.prev_bos_polygon
+                polygon_world = bos_result["polygon_world"]
+                support_point_world = bos_result["support_point_world"]
+                left_contact = bos_result["left_contact"]
+                right_contact = bos_result["right_contact"]
+                support_area = bos_result["area"]
+                inside_cog = bos_result["inside"]
+                stability_margin = bos_result["margin"]
+
                 bos_state = BOSState(
                     polygon=polygon,
-                    left_contact=bos_dict["left_contact"],
-                    right_contact=bos_dict["right_contact"],
-                    support_area=bos_dict["area"],
-                    inside_cog=inside,
-                    stability_margin=margin,
+                    polygon_world=polygon_world,
+                    support_point_world=support_point_world,
+                    left_contact=left_contact,
+                    right_contact=right_contact,
+                    support_area=support_area,
+                    inside_cog=inside_cog,
+                    stability_margin=stability_margin,
                 )
                 self.prev_bos_polygon = polygon
 
                 cop_state = self.cop_estimator.estimate(
                     COPInput(
-                        cog=(float(cog_vec[0]), float(cog_vec[1]), float(cog_vec[2])),
+                        cog=cog_vec_3d,
                         acceleration=a,
                         mass_kg=70.0,
                         polygon=polygon,

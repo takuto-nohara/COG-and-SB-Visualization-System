@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
-from typing import cast
+from typing import Any, List, Optional, Tuple, cast
 
 import numpy as np
 
 try:
-    from shapely.geometry import Point, Polygon  # type: ignore[import-not-found]
-    from shapely.ops import nearest_points  # type: ignore[import-not-found]
+    from shapely.geometry import Point as _SHAPELY_POINT  # type: ignore[import-not-found]
+    from shapely.geometry import Polygon as _SHAPELY_POLYGON  # type: ignore[import-not-found]
+    from shapely.ops import nearest_points as _SHAPELY_NEAREST_POINTS  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # pragma: no cover
-    Point = cast(object, None)
-    Polygon = cast(object, None)
-    nearest_points = cast(object, None)
+    _SHAPELY_POINT: Any | None = None
+    _SHAPELY_POLYGON: Any | None = None
+    _SHAPELY_NEAREST_POINTS: Any | None = None
     _SHAPELY_AVAILABLE = False
 else:
     _SHAPELY_AVAILABLE = True
@@ -35,13 +35,16 @@ class COPEstimator:
     def __init__(self, default_mass_kg: float = 70.0):
         self.default_mass = default_mass_kg
 
-    def _coerce_poly(self, polygon: List[Tuple[float, float]]) -> Optional[Polygon]:
-        if polygon and len(polygon) >= 3:
-            if not _SHAPELY_AVAILABLE:
-                return polygon  # type: ignore[return-value]
-            poly = Polygon(polygon)
-            if poly.is_valid and not poly.is_empty:
-                return poly
+    def _coerce_poly(self, polygon: List[Tuple[float, float]]) -> Optional[Any]:
+        if not _SHAPELY_AVAILABLE or not polygon or len(polygon) < 3:
+            return None
+        if _SHAPELY_POLYGON is None or not callable(_SHAPELY_POLYGON):
+            return None
+        poly = cast(Any, _SHAPELY_POLYGON)(polygon)
+        if poly is None:
+            return None
+        if poly.is_valid and not poly.is_empty:
+            return poly
         return None
 
     @staticmethod
@@ -121,32 +124,35 @@ class COPEstimator:
         residual = 0.0
         used = cand
 
-        if poly is None:
-            if data.prev_cop is not None:
-                used = data.prev_cop
-            residual = 0.0
-        else:
-            if _SHAPELY_AVAILABLE:
-                p = Point(cand)
-                if poly.contains(p) or poly.touches(p):  # type: ignore[union-attr]
-                    used = cand
-                    within = True
-                else:
-                    proj = nearest_points(p, poly)[1]
-                    used = (float(proj.x), float(proj.y))
-                    residual = float(p.distance(poly))
+        if (
+            poly is not None
+            and _SHAPELY_AVAILABLE
+            and _SHAPELY_POINT is not None
+            and _SHAPELY_NEAREST_POINTS is not None
+            and callable(_SHAPELY_POINT)
+            and callable(_SHAPELY_NEAREST_POINTS)
+        ):
+            poly_shape = cast(Any, poly)
+            point_obj = cast(Any, _SHAPELY_POINT)(cand)
+            if poly_shape.contains(point_obj) or poly_shape.touches(point_obj):
+                used = cand
+                within = True
+                residual = 0.0
             else:
-                if isinstance(poly, list):
-                    if self._point_in_polygon(cand, poly):
-                        used = cand
-                        within = True
-                        residual = 0.0
-                    else:
-                        used = self._project_to_polygon(cand, poly)
-                        residual = min(
-                            self._distance_to_segment(cand, poly[i], poly[(i + 1) % len(poly)])
-                            for i in range(len(poly))
-                        )
+                nearest = cast(Any, _SHAPELY_NEAREST_POINTS)(point_obj, poly_shape)[1]
+                used = (float(nearest.x), float(nearest.y))
+                residual = float(point_obj.distance(poly_shape))
+        else:
+            if self._point_in_polygon(cand, data.polygon):
+                used = cand
+                within = True
+                residual = 0.0
+            else:
+                used = self._project_to_polygon(cand, data.polygon)
+                residual = min(
+                    self._distance_to_segment(cand, data.polygon[i], data.polygon[(i + 1) % len(data.polygon)])
+                    for i in range(len(data.polygon))
+                )
 
         # friction residual (soft)
         if abs(Fx) > data.friction_mu * Fz + 1e-6:

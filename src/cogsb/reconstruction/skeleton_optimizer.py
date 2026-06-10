@@ -93,7 +93,7 @@ class SkeletonReconstructor:
             refined = joints
             residual = 0.0
             scale = float(np.linalg.norm(refined - joints))
-            return [tuple(float(v) for v in row) for row in refined], residual, scale
+            return self._to_joint_tuples(refined), residual, scale
 
         prev_np = np.array(prev_joints, dtype=np.float64) if prev_joints is not None else None
         dt = float(dt) if dt and dt > 0 else 1.0 / 30.0
@@ -124,7 +124,7 @@ class SkeletonReconstructor:
             if prev_np is not None and prev_np.shape == p.shape:
                 res.append(np.atleast_1d(self.smooth_weight * (p - prev_np).reshape(-1)))
 
-            if prev_vel_np is not None and prev_vel_np.shape == p.shape:
+            if prev_vel_np is not None and prev_np is not None and prev_vel_np.shape == p.shape:
                 predicted = prev_np + prev_vel_np * dt
                 res.append(np.atleast_1d(self.velocity_weight * (p - predicted).reshape(-1)))
 
@@ -143,9 +143,17 @@ class SkeletonReconstructor:
             refined = result.x.reshape((n, 3))
             residual = float(np.mean(np.square(result.fun)))
             scale = float(np.linalg.norm(refined - joints))
-            return [tuple(float(v) for v in row) for row in refined], residual, scale
+            return self._to_joint_tuples(refined), residual, scale
         except Exception:
-            return [tuple(float(v) for v in row) for row in joints], 0.0, 0.0
+            return self._to_joint_tuples(joints), 0.0, 0.0
+
+    @staticmethod
+    def _to_joint_tuples(points: np.ndarray) -> List[Tuple[float, float, float]]:
+        points_np = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+        result: list[tuple[float, float, float]] = []
+        for row in points_np:
+            result.append((float(row[0]), float(row[1]), float(row[2])))
+        return result
 
 
 class Smoother:
