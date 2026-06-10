@@ -24,6 +24,10 @@ _GROUND_UP_HINT_PAIRS = (
     (11, 12),  # shoulders
     (27, 28),  # ankles
 )
+_GROUND_SIDE_HINT_PAIRS = (
+    (23, 24),  # hips
+    (11, 12),  # shoulders
+)
 
 
 def _as_float(v: object) -> Optional[float]:
@@ -414,18 +418,80 @@ def _estimate_ground_alignment(
             normal = -normal
 
     target_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    rotation = _rotation_to_align_vectors(normal, target_up)
-    return rotation, centroid
+    up_axis = _rotation_to_align_vectors(normal, target_up) @ normal
+    up_axis = _normalized_vector(up_axis)
+    if up_axis is None:
+        up_axis = target_up
+
+    # Build an XYZ frame: X right, Y up, Z forward on the estimated ground.
+    # Forward hint: head -> hip midpoint, projected onto ground.
+    head = _resolve_world_point(points, 0, require_visible=False)
+    hip_mid = _average_points(points, (23, 24))
+    forward_hint: Optional[np.ndarray] = None
+    if head is not None and hip_mid is not None:
+        forward_hint = np.array(
+            (head[0] - hip_mid[0], head[1] - hip_mid[1], head[2] - hip_mid[2]),
+            dtype=np.float64,
+        )
+
+    if forward_hint is None:
+        shoulder_mid = _average_points(points, (11, 12))
+        if shoulder_mid is not None and hip_mid is not None:
+            forward_hint = np.array(
+                (shoulder_mid[0] - hip_mid[0], shoulder_mid[1] - hip_mid[1], shoulder_mid[2] - hip_mid[2]),
+                dtype=np.float64,
+            )
+
+    if forward_hint is None:
+        forward_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward_hint = forward_hint - np.dot(forward_hint, up_axis) * up_axis
+    forward_axis = _normalized_vector(forward_hint)
+    if forward_axis is None:
+        forward_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    right_axis = None
+    for start_idx, end_idx in _GROUND_SIDE_HINT_PAIRS:
+        p_start = _resolve_world_point(points, start_idx, require_visible=False)
+        p_end = _resolve_world_point(points, end_idx, require_visible=False)
+        if p_start is None or p_end is None:
+            continue
+        candidate = np.array(
+            (p_end[0] - p_start[0], p_end[1] - p_start[1], p_end[2] - p_start[2]),
+            dtype=np.float64,
+        )
+        candidate = candidate - np.dot(candidate, up_axis) * up_axis
+        right_axis = _normalized_vector(candidate)
+        if right_axis is not None:
+            break
+
+    if right_axis is None:
+        right_axis = _normalized_vector(np.cross(up_axis, forward_axis))
+    if right_axis is None:
+        right_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    forward_axis = np.cross(right_axis, up_axis)
+    forward_axis = _normalized_vector(forward_axis)
+    if forward_axis is None:
+        forward_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    # Rows are destination axes. transformed = R * (point - origin) -> [X,Y,Z].
+    rotation = np.vstack([right_axis, up_axis, forward_axis])
+    return rotation.astype(np.float64), centroid
 
 
 def _apply_ground_alignment(
     point: Tuple[float, float, float],
     alignment: Optional[tuple[np.ndarray, np.ndarray]],
+    *,
+    project_to_ground: bool = False,
 ) -> Tuple[float, float, float]:
     if alignment is None:
         return point
     rotation, origin = alignment
     mapped = rotation @ (np.asarray(point, dtype=np.float64) - origin)
+    if project_to_ground:
+        return float(mapped[0]), 0.0, float(mapped[2])
     return float(mapped[0]), float(mapped[1]), float(mapped[2])
 
 
@@ -525,8 +591,8 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
     frame_h, frame_w = int(frame.shape[0]), int(frame.shape[1])
     scene = np.full((frame_h, frame_w, 3), 18, dtype=np.uint8)
 
-    yaw = _coerce_render_state(render_state, "yaw", -40.0)
-    pitch = _coerce_render_state(render_state, "pitch", 22.0)
+    yaw = _coerce_render_state(render_state, "yaw", 0.0)
+    pitch = _coerce_render_state(render_state, "pitch", 0.0)
     zoom = _coerce_render_state(render_state, "zoom", 1.0)
     pan_x = _coerce_render_state(render_state, "pan_x", 0.0)
     pan_y = _coerce_render_state(render_state, "pan_y", 0.0)
@@ -564,7 +630,7 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
     if isinstance(cop, Mapping):
         cop_xy = _as_point(cop.get("cop"))
         if cop_xy is not None:
-            ax, ay, az = _apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment)
+            ax, ay, az = _apply_ground_alignment((cop_xy[0], cop_xy[1], 0.0), ground_alignment, project_to_ground=True)
             visible_points.append((ax, ay, az))
 
     bos = overlay.get("bos")
@@ -573,7 +639,7 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
             point = _as_point(raw_point)
             if point is None:
                 continue
-            ax, ay, az = _apply_ground_alignment((point[0], point[1], 0.0), ground_alignment)
+            ax, ay, az = _apply_ground_alignment((point[0], point[1], 0.0), ground_alignment, project_to_ground=True)
             visible_points.append((ax, ay, az))
 
     for segment in SEGMENT_TABLE:
@@ -607,11 +673,29 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
         ((0.0, -axis_scale, 0.0), (0.0, axis_scale, 0.0), (80, 255, 80)),
         ((0.0, 0.0, -axis_scale), (0.0, 0.0, axis_scale), (80, 80, 255)),
     ]
+    axis_labels = [
+        ((axis_scale, 0.0, 0.0), "X"),
+        ((0.0, axis_scale, 0.0), "Y"),
+        ((0.0, 0.0, axis_scale), "Z"),
+    ]
     for axis_start, axis_end, color in axes:
         p0, z0 = project(axis_start)
         p1, z1 = project(axis_end)
         cv2.line(scene, p0, p1, color, 1, cv2.LINE_AA)
         cv2.putText(scene, str(abs(round(axis_scale))), (p1[0] + 2, p1[1] + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+    for axis_end, label in axis_labels:
+        p, _ = project(axis_end)
+        cv2.putText(
+            scene,
+            label,
+            (p[0] + 4, p[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
 
     # Segments (far to near)
     segments_draw: list[tuple[float, Tuple[int, int], Tuple[int, int], Tuple[int, int, int], int]] = []
@@ -678,6 +762,16 @@ def _draw_frame_space3d(frame, overlay: Mapping[str, Any], render_state: Optiona
             cv2.polylines(scene, [pts], isClosed=True, color=(120, 255, 120), thickness=2, lineType=cv2.LINE_AA)
 
     cv2.putText(scene, "3D Mode", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (170, 170, 170), 1, cv2.LINE_AA)
+    cv2.putText(
+        scene,
+        "XYZ: X=right, Y=up, Z=front",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA,
+    )
     return scene
 
 
