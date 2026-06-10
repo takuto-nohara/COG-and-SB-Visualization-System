@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Callable, List, Optional
+import threading
 import time
 
 import numpy as np
@@ -53,7 +54,15 @@ class AnalysisEngine:
         a = (v - self.prev_cog_vel) / dt
         return tuple(float(x) for x in v), tuple(float(x) for x in a)
 
-    def run(self, source, estimator, max_frames: Optional[int] = None) -> List[FrameOutput]:
+    def run(
+        self,
+        source,
+        estimator,
+        max_frames: Optional[int] = None,
+        *,
+        on_frame: Optional[Callable[[object, FrameOutput], bool | None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[FrameOutput]:
         session_id = new_session_id("session")
         writer = FrameWriter(self.config.output_dir)
         outputs: List[FrameOutput] = []
@@ -61,6 +70,8 @@ class AnalysisEngine:
 
         try:
             for frame in source.iter_frames(max_frames=max_frames):
+                if stop_event is not None and stop_event.is_set():
+                    break
                 start_ms = time.perf_counter()
                 pose_frame = estimator.estimate(frame.frame, frame.frame_idx, frame.source_timestamp)
 
@@ -78,6 +89,13 @@ class AnalysisEngine:
                     )
                     outputs.append(out)
                     writer.write_frame(out)
+                    if on_frame is not None:
+                        try:
+                            should_continue = on_frame(frame, out)
+                        except Exception:
+                            should_continue = False
+                        if should_continue is False:
+                            break
                     continue
 
                 if frame.frame_idx == 0:
@@ -189,6 +207,13 @@ class AnalysisEngine:
 
                 outputs.append(out)
                 writer.write_frame(out)
+                if on_frame is not None:
+                    try:
+                        should_continue = on_frame(frame, out)
+                    except Exception:
+                        should_continue = False
+                    if should_continue is False:
+                        break
 
                 if self.config.mode == PipelineMode.REALTIME and self.config.max_frames and self.stats_processed >= self.config.max_frames:
                     break

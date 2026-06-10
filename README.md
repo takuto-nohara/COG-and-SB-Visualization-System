@@ -26,6 +26,26 @@ python -m pip install -e .[analysis]
 cogsb analyze --source live --source-id 0 --mode realtime
 ```
 
+### GUI 起動
+```bash
+.\cogsb-gui.cmd
+```
+`cogsb-gui` 相当の起動スクリプトです。実行時に依存関係を解決 (`pip install -e .`) し、GUIを起動します（ネットワーク/権限のある環境で初回のみ時間がかかります）。
+
+`.\cogsb-gui.cmd` 実行後、同じユーザー環境では通常 `cogsb-gui` が直接実行可能になります。PATH がすぐ反映されない場合は、次節の手順で追加してください。
+
+`cogsb-gui` コマンドが認識されない場合は、まず `.\cogsb-gui.cmd` を 1 回実行してください。実行中に PATH 上の書き込み可能なディレクトリへ `cogsb-gui.cmd` を作成し、同一シェル内でも次回から `cogsb-gui` で起動できるようにします。
+
+どうしても `cogsb-gui` が使えない場合は、警告に従って次のように PATH を追加します（永続化可）。
+```powershell
+$userScript = (python -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))")
+$env:PATH = "$userScript;$env:PATH"
+[Environment]::SetEnvironmentVariable("Path", "$userScript;" + [Environment]::GetEnvironmentVariable("Path","User"), "User")
+```
+
+GUI では「写真」「動画」「リアルタイム映像」を選択して解析を開始できます。
+画像/動画ファイルは画面内で選択し、3種類すべてで解析結果のフレーム上に重心（COG）と支持基底面（BOS）を同じ描画領域に重畳して表示します。
+
 ### 1コマンド起動
 ```bash
 python -m pip install -e .
