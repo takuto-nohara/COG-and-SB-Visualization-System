@@ -55,6 +55,9 @@ def analyze(
     smpl_model: Optional[str] = typer.Option(None, help="SMPLモデルディレクトリ（任意）"),
     enable_smpl: bool = typer.Option(False, help="SMPLフィッティングを有効化"),
 ) -> None:
+    if max_frames is not None and not isinstance(max_frames, int):
+        max_frames = None
+
     if source not in {"live", "file", "image"}:
         raise typer.BadParameter("source は live / file / image を指定してください")
     if source in {"file", "image"} and not path:

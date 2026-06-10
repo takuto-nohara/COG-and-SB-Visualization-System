@@ -11,7 +11,12 @@ def main() -> None:
         mode="realtime",
         output_dir="outputs",
         smoothness=0.35,
+        max_frames=None,
     )
 
 
 __all__ = ["main"]
+
+
+if __name__ == "__main__":
+    main()

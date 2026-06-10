@@ -33,6 +33,21 @@ cogsb-start
 ```
 `cogsb-start` はライブ映像を `--source live --source-id 0 --mode realtime` で起動します。
 
+環境によっては `cogsb-start` が PATH に反映されない場合があります。その場合は以下でも起動できます。
+```bash
+python -m cogsb.cli.start
+```
+
+### mediapipe API 差分への対応
+Python 3.13 では `mediapipe 0.10.35` 系で `mediapipe.solutions` が使えない場合があります。  
+この環境向けに、`mediapipe.tasks` API を使って実行する際は `.task` モデルを初回起動時に自動取得します。
+
+モデルファイルの場所を固定したい場合は以下を指定できます。
+```bash
+$env:COGSB_POSE_LANDMARKER_TASK_PATH = "C:\\path\\to\\pose_landmarker_lite.task"
+python -m cogsb.cli.start
+```
+
 ### 録画入力（mp4）
 ```bash
 cogsb analyze --source file --path sample.mp4 --mode offline --output-dir outputs\run01
