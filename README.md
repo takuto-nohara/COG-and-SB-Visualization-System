@@ -100,6 +100,11 @@ cogsb-start
   - `bos`: ボリュームポリゴン、左右接地値、BOS内判定
   - `cop`: COP位置、反力/残差、BOS内判定
 
+## ドキュメント
+
+- [動作原理](docs/system_principles.md): COG / BOS / COP の計算式と処理フロー
+- [BOS計算の参考文献](docs/bos_calculation_references.md): 支持基底面計算の根拠と適用方針
+
 ## 既知補足
 
 - MediaPipe は環境により `solutions` / `tasks` API が使い分けられます。
